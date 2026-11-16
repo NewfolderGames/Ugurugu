@@ -60,6 +60,10 @@ pub fn window(ui: &mut egui::Ui, parts: Parts<'_>) -> Shown {
     let mut ants = None;
     panels.follow_document(canvas);
     panels.color.follow(canvas.tools().color);
+    if !panels.gradients_loaded {
+        panels.gradients = settings.get().gradients.clone();
+        panels.gradients_loaded = true;
+    }
     // Asked for again by the navigator if it is shown.
     panels.navigator.wanted = None;
     super::actions::sync_animation_tools(canvas, &mut panels.layout);
@@ -179,6 +183,7 @@ pub fn window(ui: &mut egui::Ui, parts: Parts<'_>) -> Shown {
             ants = super::selection_overlay(ui, canvas);
             super::resize::sizing_overlay(ui, canvas);
             super::text_overlay(ui, canvas);
+            super::gradient_overlay(ui, canvas);
             super::pick_cursor(ui, canvas);
             super::pose_overlay(ui, canvas);
             super::brush_cursor(ui, canvas);
@@ -194,6 +199,11 @@ pub fn window(ui: &mut egui::Ui, parts: Parts<'_>) -> Shown {
                 });
         });
     super::dock_floating(ui, canvas, panels);
+    if panels.gradients_changed {
+        let updated = panels.gradients.clone();
+        settings.change(|stored| stored.gradients = updated);
+        panels.gradients_changed = false;
+    }
     super::actions::end_frame(ui.ctx());
     Shown { canvas_area, ants }
 }
@@ -552,12 +562,13 @@ mod tests {
         );
     }
 
-    const TOOLS: [ugu_session::Tool; 9] = [
+    const TOOLS: [ugu_session::Tool; 10] = [
         ugu_session::Tool::Pen,
         ugu_session::Tool::Eraser,
         ugu_session::Tool::Select,
         ugu_session::Tool::Wand,
         ugu_session::Tool::Fill,
+        ugu_session::Tool::Gradient,
         ugu_session::Tool::Text,
         ugu_session::Tool::Shape,
         ugu_session::Tool::Symmetry,

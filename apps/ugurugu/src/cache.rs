@@ -798,6 +798,7 @@ mod tests {
             antialias: false,
             clip: None,
             behind: false,
+            pattern: None,
         });
         assert!(matches!(export_within(&renders, broken), Some(None)));
         assert!(matches!(

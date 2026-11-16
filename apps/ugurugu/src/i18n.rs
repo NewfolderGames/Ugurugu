@@ -205,6 +205,7 @@ fn name_message(kind: Named) -> &'static str {
         Named::Group => "group-name",
         Named::AnimationFolder => "animation-folder-name",
         Named::Cel => "cel-name",
+        Named::Filter => "filter-name",
     }
 }
 
@@ -271,6 +272,7 @@ mod tests {
                 Named::Group,
                 Named::AnimationFolder,
                 Named::Cel,
+                Named::Filter,
             ] {
                 let name = format(&bundles, name_message(kind), Some(&args)).unwrap();
                 assert!(name.contains("37"), "{code} {kind:?}: {name}");

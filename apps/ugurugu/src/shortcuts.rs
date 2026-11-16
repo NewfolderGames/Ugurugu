@@ -445,6 +445,7 @@ actions! {
     CancelTransform "cancelSelectionTransform" "transform-cancel" [] [];
     AddLayer "addLayer" "layer-add" [ctrl_shift(Key::N)] [];
     AddGroup "addGroup" "layer-add-group" [] [];
+    AddFilterLayer "addFilterLayer" "layer-add-filter" [] [];
     Ungroup "ungroup" "layer-ungroup" [] [];
     DuplicateLayer "duplicateLayer" "layer-duplicate" [ctrl(Key::J)] [];
     MergeDown "mergeDown" "layer-merge" [ctrl(Key::E)] [];
@@ -480,6 +481,7 @@ actions! {
     Select "lasso" "tool-select" [plain(Key::L)] [];
     Wand "wand" "tool-wand" [plain(Key::W)] [];
     Fill "bucket" "tool-fill" [plain(Key::G)] [];
+    Gradient "gradient" "tool-gradient" [shift(Key::G)] [];
     Text "text" "tool-text" [plain(Key::T)] [];
     Eyedropper "eyedropper" "tool-eyedropper" [plain(Key::I)] [];
     Shape "shape" "tool-shape" [plain(Key::U)] [];

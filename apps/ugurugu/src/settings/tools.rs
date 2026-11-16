@@ -7,14 +7,17 @@
 
 use serde_json::{Map, Value, json};
 use ugu_core::brush::{self, Preset};
+use ugu_core::dither::Dither;
+use ugu_core::gradient::{self, Gradient, GradientShape, GradientStop, QuantizeMode};
 use ugu_core::ops::{Rgba8, Sampling};
+use ugu_core::pattern;
 use ugu_core::store::limits::{FADE, STROKE_WIDTH};
 use ugu_session::{
-    Brushes, ColorHistory, Kept, Reads, Shape, ShapeKind, ShapePaint, ShapeSettings, TextSettings,
-    Tool, ToolSettings, Tools, is_pixel,
+    Brushes, ColorHistory, GradientSettings, Kept, Reads, Shape, ShapeKind, ShapePaint,
+    ShapeSettings, TextSettings, Tool, ToolSettings, Tools, is_pixel,
 };
 
-const TOOLS: [(Tool, &str); 10] = [
+const TOOLS: [(Tool, &str); 11] = [
     (Tool::Pen, "brush"),
     (Tool::Eraser, "eraser"),
     (Tool::Select, "select"),
@@ -25,6 +28,26 @@ const TOOLS: [(Tool, &str); 10] = [
     (Tool::Shape, "shape"),
     (Tool::Move, "move"),
     (Tool::Symmetry, "symmetry"),
+    (Tool::Gradient, "gradient"),
+];
+const GRADIENT_SHAPES: [(GradientShape, &str); 2] = [
+    (GradientShape::Linear, "linear"),
+    (GradientShape::Radial, "radial"),
+];
+const DITHERS: [(Dither, &str); 13] = [
+    (Dither::None, "none"),
+    (Dither::Constant, "constant"),
+    (Dither::Checker, "checker"),
+    (Dither::HorizontalLines, "horizontalLines"),
+    (Dither::VerticalLines, "verticalLines"),
+    (Dither::Diagonal, "diagonal"),
+    (Dither::Crosshatch, "crosshatch"),
+    (Dither::Halftone, "halftone"),
+    (Dither::Bayer2, "bayer2"),
+    (Dither::Bayer4, "bayer4"),
+    (Dither::Bayer8, "bayer8"),
+    (Dither::FloydSteinberg, "floydSteinberg"),
+    (Dither::Atkinson, "atkinson"),
 ];
 const SHAPES: [(ShapeKind, &str); 3] = [
     (ShapeKind::Freehand, "freehand"),
@@ -120,6 +143,165 @@ pub(super) fn parse_color(text: &str) -> Option<Rgba8> {
     }
     let channel = |at: usize| u8::from_str_radix(&digits[at..at + 2], 16).ok();
     Some(Rgba8([channel(0)?, channel(2)?, channel(4)?, channel(6)?]))
+}
+
+fn dither_name(dither: Dither) -> &'static str {
+    name(&DITHERS, dither)
+}
+
+pub(super) fn gradient_to_json(gradient: &Gradient) -> Value {
+    let stops: Vec<Value> = gradient
+        .stops
+        .iter()
+        .map(|stop| {
+            json!({
+                "at": stop.position,
+                "color": color_text(stop.color),
+            })
+        })
+        .collect();
+    json!({ "stops": stops })
+}
+
+pub(super) fn parse_gradient(value: &Value) -> Option<Gradient> {
+    let object = value.as_object()?;
+    let list = object.get("stops")?.as_array()?;
+    let mut stops = Vec::with_capacity(list.len().min(*gradient::limits::STOPS.end()));
+    let mut last_at = 0.0_f32;
+    for entry in list {
+        if stops.len() >= *gradient::limits::STOPS.end() {
+            tracing::warn!("extra gradient stops past the limit were dropped");
+            break;
+        }
+        let Some(item) = entry.as_object() else {
+            tracing::warn!(%entry, "a gradient stop is not an object");
+            return None;
+        };
+        let Some(raw_at) = item.get("at").and_then(Value::as_f64).map(|n| n as f32) else {
+            tracing::warn!(%entry, "a gradient stop position is missing or not a number");
+            return None;
+        };
+        if !raw_at.is_finite() {
+            tracing::warn!(%entry, "a gradient stop position is not finite");
+            return None;
+        }
+        let clamped_at = raw_at.clamp(0.0, 1.0);
+        if clamped_at != raw_at {
+            tracing::warn!(
+                raw_at,
+                clamped_at,
+                "a gradient stop position was out of range"
+            );
+        }
+        let position = clamped_at.max(last_at);
+        if position != clamped_at {
+            tracing::warn!(clamped_at, position, "gradient stop position was reordered");
+        }
+        last_at = position;
+        let Some(color) = item
+            .get("color")
+            .and_then(Value::as_str)
+            .and_then(parse_color)
+        else {
+            tracing::warn!(%entry, "a gradient stop colour is not #rrggbbaa");
+            return None;
+        };
+        stops.push(GradientStop { position, color });
+    }
+    let gradient = Gradient::new(stops);
+    if !gradient.is_valid() {
+        tracing::warn!("gradient has too few stops or is invalid");
+        return None;
+    }
+    Some(gradient)
+}
+
+fn read_gradient_settings(value: &Map<String, Value>, settings: &mut GradientSettings) {
+    if value.contains_key("stops")
+        && let Some(gradient) = parse_gradient(&Value::Object(value.clone()))
+    {
+        settings.gradient = gradient;
+    }
+    named(value, "shape", &GRADIENT_SHAPES, &mut settings.shape);
+    named(value, "dither", &DITHERS, &mut settings.dither);
+    if let Some(q) = value.get("quantize") {
+        let Some(q) = q.as_object() else {
+            tracing::warn!("gradient quantize setting is not an object");
+            return;
+        };
+        let levels = match q.get("levels") {
+            None => None,
+            Some(v) => match v.as_f64() {
+                Some(n) if n.is_finite() => Some(n.round() as i64),
+                _ => {
+                    tracing::warn!(key = "quantize.levels", %v, "a tool setting is not a number");
+                    None
+                }
+            },
+        };
+        match q.get("mode").and_then(Value::as_str) {
+            Some("overall") => {
+                let raw = levels.unwrap_or(match settings.quantize {
+                    QuantizeMode::Overall(n) => i64::from(n),
+                    QuantizeMode::PerSegment(_) => 4,
+                });
+                let range = gradient::limits::OVERALL_LEVELS;
+                let kept = raw.clamp(i64::from(*range.start()), i64::from(*range.end())) as u8;
+                if i64::from(kept) != raw {
+                    tracing::warn!(
+                        key = "quantize.levels",
+                        raw,
+                        kept,
+                        "a tool setting was out of range"
+                    );
+                }
+                settings.quantize = QuantizeMode::Overall(kept);
+            }
+            Some("segment") => {
+                let raw = levels.unwrap_or(match settings.quantize {
+                    QuantizeMode::PerSegment(n) => i64::from(n),
+                    QuantizeMode::Overall(_) => 4,
+                });
+                let range = gradient::limits::SEGMENT_LEVELS;
+                let kept = raw.clamp(i64::from(*range.start()), i64::from(*range.end())) as u8;
+                if i64::from(kept) != raw {
+                    tracing::warn!(
+                        key = "quantize.levels",
+                        raw,
+                        kept,
+                        "a tool setting was out of range"
+                    );
+                }
+                settings.quantize = QuantizeMode::PerSegment(kept);
+            }
+            Some(other) => tracing::warn!(mode = other, "unknown gradient quantize mode"),
+            None => {}
+        }
+    }
+    if let Some(opacity) = number(value, "opacity", 0.01..=1.0) {
+        settings.opacity = opacity;
+    }
+    boolean(value, "usePrimary", &mut settings.use_pen_color);
+}
+
+fn gradient_settings_to_json(settings: &GradientSettings) -> Value {
+    let mut map = match gradient_to_json(&settings.gradient) {
+        Value::Object(map) => map,
+        _ => unreachable!(),
+    };
+    map.insert(
+        "shape".to_owned(),
+        name(&GRADIENT_SHAPES, settings.shape).into(),
+    );
+    map.insert("dither".to_owned(), dither_name(settings.dither).into());
+    let quantize = match settings.quantize {
+        QuantizeMode::Overall(levels) => json!({ "mode": "overall", "levels": levels }),
+        QuantizeMode::PerSegment(levels) => json!({ "mode": "segment", "levels": levels }),
+    };
+    map.insert("quantize".to_owned(), quantize);
+    map.insert("opacity".to_owned(), settings.opacity.into());
+    map.insert("usePrimary".to_owned(), settings.use_pen_color.into());
+    Value::Object(map)
 }
 
 /// The preset named `id` among `presets`, a pixel one when `pixel_only`,
@@ -329,6 +511,18 @@ pub(super) fn read(value: &Value, mut tools: Tools) -> Tools {
     if let Some(before) = object(value, "beforePixel") {
         read_before_pixel(before, &mut tools);
     }
+    if let Some(gradient) = object(value, "gradient") {
+        read_gradient_settings(gradient, &mut tools.gradient);
+    }
+    match top.get("pattern") {
+        None => {}
+        Some(Value::Null) => tools.pattern = None,
+        Some(Value::String(id)) => match pattern::find(id) {
+            Some(found) => tools.pattern = Some(found.pattern),
+            None => tracing::warn!(id, "unknown pattern in the settings"),
+        },
+        Some(value) => tracing::warn!(%value, "the pattern in the settings is not a name"),
+    }
     tools
 }
 
@@ -404,8 +598,12 @@ pub(super) fn to_json(tools: &Tools) -> Value {
             "antialias": tools.fill.antialias,
         },
         "text": text,
+        "gradient": gradient_settings_to_json(&tools.gradient),
     });
     let object = value.as_object_mut().expect("an object");
+    if let Some(id) = tools.pattern.and_then(pattern::name_of) {
+        object.insert("pattern".to_owned(), id.into());
+    }
     object.extend(brushes_to_json(&tools.plain));
     if let Some(Value::Object(brush)) = object.get_mut("brush") {
         brush.insert("color".to_owned(), color_text(tools.color).into());
@@ -502,6 +700,28 @@ mod tests {
             size: 120.0,
             filled: true,
         };
+        tools.gradient = GradientSettings {
+            gradient: Gradient::new(vec![
+                GradientStop {
+                    position: 0.0,
+                    color: Rgba8([10, 20, 30, 255]),
+                },
+                GradientStop {
+                    position: 0.4,
+                    color: Rgba8([200, 100, 50, 128]),
+                },
+                GradientStop {
+                    position: 1.0,
+                    color: Rgba8([255, 255, 255, 0]),
+                },
+            ]),
+            shape: GradientShape::Radial,
+            dither: Dither::Atkinson,
+            quantize: QuantizeMode::PerSegment(6),
+            opacity: 0.75,
+            use_pen_color: true,
+        };
+        tools.pattern = Some(pattern::find("checker-50").unwrap().pattern);
         tools
     }
 
@@ -526,6 +746,7 @@ mod tests {
             Tool::Shape,
             Tool::Move,
             Tool::Symmetry,
+            Tool::Gradient,
         ];
         for tool in every {
             // A new tool does not build here until it is listed above.
@@ -539,7 +760,8 @@ mod tests {
                 | Tool::Eyedropper
                 | Tool::Shape
                 | Tool::Move
-                | Tool::Symmetry => {}
+                | Tool::Symmetry
+                | Tool::Gradient => {}
             }
             let tools = Tools {
                 tool,
@@ -563,6 +785,15 @@ mod tests {
             "fill": { "tolerance": 400, "reads": "marked" },
             "tablet": { "pressure": "off" },
             "text": { "size": 2, "family": "" },
+            "pattern": "no-such-pattern",
+            "gradient": {
+                "stops": [{ "at": 0.0, "color": "bad" }],
+                "shape": "conic",
+                "dither": "bogus",
+                "quantize": { "mode": "segment", "levels": 99 },
+                "opacity": 5.0,
+                "usePrimary": "yes",
+            },
         }));
         assert_eq!(tools.tool, Tool::Pen);
         assert_eq!(tools.plain.pen.preset.id, brush::BRUSHES[0].id);
@@ -580,6 +811,19 @@ mod tests {
         assert_eq!(tools.fill.reads, Reads::Marked);
         assert_eq!(tools.text.size, *TextSettings::SIZE.start());
         assert_eq!(tools.text.family, None);
+        assert_eq!(tools.pattern, None);
+        assert_eq!(
+            tools.gradient.gradient,
+            GradientSettings::default().gradient
+        );
+        assert_eq!(tools.gradient.shape, GradientShape::Linear);
+        assert_eq!(tools.gradient.dither, Dither::Bayer4);
+        assert_eq!(
+            tools.gradient.quantize,
+            QuantizeMode::PerSegment(*gradient::limits::SEGMENT_LEVELS.end())
+        );
+        assert_eq!(tools.gradient.opacity, 1.0);
+        assert!(!tools.gradient.use_pen_color);
     }
 
     #[test]

@@ -80,6 +80,7 @@ impl Presets {
             | Tool::Select
             | Tool::Wand
             | Tool::Fill
+            | Tool::Gradient
             | Tool::Text
             | Tool::Eyedropper
             | Tool::Shape
@@ -93,6 +94,7 @@ impl Presets {
             | Tool::Select
             | Tool::Wand
             | Tool::Fill
+            | Tool::Gradient
             | Tool::Text
             | Tool::Eyedropper
             | Tool::Shape
@@ -107,6 +109,7 @@ impl Presets {
             | Tool::Select
             | Tool::Wand
             | Tool::Fill
+            | Tool::Gradient
             | Tool::Text
             | Tool::Eyedropper
             | Tool::Shape
@@ -356,6 +359,7 @@ fn brush_preview(preset: &Preset, scale: f32, pressure: bool) -> Document {
         width: preset.size.min(14.0) * scale,
         brush: preset.brush,
         seed: seed(preset),
+        pattern: None,
     };
     document.store.strokes.insert(StrokeId(0), stroke);
     with_ops(
@@ -380,6 +384,7 @@ fn eraser_preview(preset: &Preset, scale: f32) -> Document {
             ..store::Brush::DEFAULT
         },
         seed: 0,
+        pattern: None,
     };
     let samples = 18;
     let diagonal = (0..samples).map(|index| {
@@ -392,6 +397,7 @@ fn eraser_preview(preset: &Preset, scale: f32) -> Document {
         width: 16.0 * scale,
         brush: preset.brush,
         seed: seed(preset),
+        pattern: None,
     };
     document.store.strokes.insert(StrokeId(0), band);
     document.store.strokes.insert(StrokeId(1), rub);

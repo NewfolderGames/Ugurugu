@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 use ugu_core::document::limits;
+use ugu_core::gradient::Gradient;
 use ugu_session::Tools;
 
 use crate::layout::Layout;
@@ -79,6 +80,12 @@ impl Language {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct SavedGradient {
+    pub name: String,
+    pub gradient: Gradient,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     /// Takes effect at the next start, as in 2.2.13.
     pub language: Language,
@@ -99,6 +106,8 @@ pub struct Settings {
     pub pixel_export_times: Option<u32>,
     /// The tools and colour history as last left.
     pub tools: Tools,
+    /// User-saved custom gradient presets.
+    pub gradients: Vec<SavedGradient>,
     /// The shortcuts changed from their defaults.
     pub shortcuts: Shortcuts,
     /// Whether to check for updates by itself.
@@ -123,6 +132,7 @@ impl Default for Settings {
             export_edge: None,
             pixel_export_times: None,
             tools: Tools::default(),
+            gradients: Vec::new(),
             shortcuts: Shortcuts::default(),
             check_updates: true,
             layout: Layout::default(),
@@ -145,6 +155,7 @@ impl Settings {
                 uses_pressure: Tools::default().uses_pressure,
                 ..self.tools.clone()
             },
+            gradients: self.gradients.clone(),
             shortcuts: self.shortcuts.restored(),
             layout: self.layout.clone(),
             window: self.window,
@@ -252,6 +263,9 @@ impl Settings {
         if let Some(value) = object.remove("colorHistory") {
             settings.tools.colors = tools::parse_history(&value);
         }
+        if let Some(value) = object.remove("gradients") {
+            settings.gradients = parse_saved_gradients(&value);
+        }
         if let Some(value) = object.remove("shortcuts") {
             settings.shortcuts = Shortcuts::parse(&value);
         }
@@ -333,6 +347,12 @@ impl Settings {
                 tools::history_to_json(&self.tools.colors),
             );
         }
+        if !self.gradients.is_empty() {
+            object.insert(
+                "gradients".to_owned(),
+                saved_gradients_to_json(&self.gradients),
+            );
+        }
         if let Some(shortcuts) = self.shortcuts.to_json() {
             object.insert("shortcuts".to_owned(), shortcuts);
         }
@@ -364,6 +384,44 @@ fn to_text(object: Map<String, Value>) -> String {
         serde_json::to_string_pretty(&Value::Object(object)).expect("settings are plain JSON");
     text.push('\n');
     text
+}
+
+fn parse_saved_gradients(value: &Value) -> Vec<SavedGradient> {
+    let Some(entries) = value.as_array() else {
+        tracing::warn!("the saved gradients setting is not a list");
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())?;
+            let gradient = tools::parse_gradient(entry)?;
+            Some(SavedGradient {
+                name: name.to_owned(),
+                gradient,
+            })
+        })
+        .collect()
+}
+
+fn saved_gradients_to_json(gradients: &[SavedGradient]) -> Value {
+    Value::Array(
+        gradients
+            .iter()
+            .map(|saved| {
+                let mut map = match tools::gradient_to_json(&saved.gradient) {
+                    Value::Object(map) => map,
+                    _ => unreachable!(),
+                };
+                map.insert("name".to_owned(), saved.name.clone().into());
+                Value::Object(map)
+            })
+            .collect(),
+    )
 }
 
 /// Removes `key` from `object` and reads it with `read`, logging a value of
@@ -828,6 +886,10 @@ mod tests {
                 tools.colors.record(ugu_core::ops::Rgba8([1, 2, 3, 4]));
                 tools
             },
+            gradients: vec![SavedGradient {
+                name: "Sunset".to_owned(),
+                gradient: Gradient::from_preset(&ugu_core::gradient::PRESETS[2]),
+            }],
             shortcuts: {
                 let mut shortcuts = Shortcuts::default();
                 let fit = crate::shortcuts::Chord::parse("F").unwrap();

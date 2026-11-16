@@ -13,10 +13,12 @@ use std::sync::Arc;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, Ui, Vec2};
 use ugu_core::command;
+use ugu_core::dither::{self, Dither, Screentone, ToneShape};
 use ugu_core::document::limits::OUTLINE_WIDTH;
 use ugu_core::document::{Document, Layer, LayerId, LayerKind};
 use ugu_core::edit::{EditError, Outcome};
-use ugu_core::ops::{Blend, MergeRefusal, Outline, Rgba8, Wobble};
+use ugu_core::gradient::{Gradient, QuantizeMode};
+use ugu_core::ops::{Blend, FilterKind, MergeRefusal, Outline, Rgba8, Wobble};
 use ugu_session::Session;
 
 use crate::canvas::Canvas;
@@ -54,6 +56,13 @@ pub struct LayerDock {
     /// Outline colour being picked, committed when the pointer lets go.
     outline_color: Option<(LayerId, [u8; 4])>,
     outline_picking: bool,
+    /// Shared gradient/quantize editor state for Gradient Map filters.
+    gradient_editor: super::gradient::GradientEditorState,
+    /// Transient filter kind `(layer, loaded_baseline, edited)` before committing.
+    filter_edit: Option<(LayerId, FilterKind, FilterKind)>,
+    tone_dot_picking: bool,
+    tone_bg_picking: bool,
+    tone_color_dirty: bool,
     /// The layer being dragged in the list.
     dragging: Option<LayerId>,
     thumbnails: HashMap<LayerId, Thumbnail>,
@@ -111,6 +120,7 @@ struct Row {
     folded: Option<bool>,
     clipped: bool,
     reference: bool,
+    filter: bool,
     /// For a paint layer, whether it wobbles.
     wobbles: Option<bool>,
     /// Whether it has keys, and whether it is an animation folder.
@@ -146,11 +156,12 @@ fn flatten(
             folded: matches!(layer.kind, LayerKind::Group(_)).then_some(fold),
             clipped: layer.clip_to_below(),
             reference: layer.reference,
+            filter: matches!(layer.kind, LayerKind::Filter(_)),
             wobbles: match &layer.kind {
                 LayerKind::Paint(paint) => {
                     Some(paint.wobble.unwrap_or(document.wobble).amount > 0.0)
                 }
-                LayerKind::Group(_) => None,
+                LayerKind::Group(_) | LayerKind::Filter(_) => None,
             },
             keyed: !layer.keys().is_empty(),
             folder: layer.cels().is_some(),
@@ -233,6 +244,7 @@ fn report(refusal: &mut Option<String>, result: Result<Outcome, EditError>) {
 pub enum LayerAction {
     Add,
     AddGroup,
+    AddFilter,
     Ungroup,
     Duplicate,
     MergeDown,
@@ -248,14 +260,20 @@ pub fn can(action: LayerAction, canvas: &Canvas) -> bool {
     let document = session.document();
     let current = session.current_layer();
     let Some(layer) = document.layer(current) else {
-        return matches!(action, LayerAction::Add | LayerAction::AddGroup);
+        return matches!(
+            action,
+            LayerAction::Add | LayerAction::AddGroup | LayerAction::AddFilter
+        );
     };
     let (count, index) = document
         .position(current)
         .and_then(|(parent, index)| Some((command::siblings(document, parent)?.len(), index)))
         .unwrap_or((0, 0));
     match action {
-        LayerAction::Add | LayerAction::AddGroup | LayerAction::ShowOrHide => true,
+        LayerAction::Add
+        | LayerAction::AddGroup
+        | LayerAction::AddFilter
+        | LayerAction::ShowOrHide => true,
         LayerAction::Ungroup => matches!(layer.kind, LayerKind::Group(_)),
         LayerAction::Duplicate => session.can_duplicate_layer(),
         LayerAction::MergeDown => merge_refusal(document, current).is_none(),
@@ -273,6 +291,9 @@ pub fn run(action: LayerAction, canvas: &mut Canvas, refusal: &mut Option<String
             canvas.edit(Session::add_layer)
         }
         LayerAction::AddGroup => canvas.edit(Session::add_group),
+        LayerAction::AddFilter => {
+            canvas.edit(|session| session.add_filter_layer(FilterKind::default()))
+        }
         LayerAction::Ungroup => canvas.edit(Session::ungroup),
         LayerAction::Duplicate => canvas.edit(|session| session.duplicate_layer(copy_name)),
         LayerAction::MergeDown => canvas.edit(Session::merge_down),
@@ -317,17 +338,19 @@ impl LayerDock {
     fn refresh(&mut self, ctx: &egui::Context, canvas: &Canvas, layers: &[Layer], paper: [u8; 4]) {
         for layer in layers {
             let made = match &layer.kind {
-                LayerKind::Paint(_) => canvas.thumbnail(layer.id).and_then(|(revision, pixmap)| {
-                    if self
-                        .thumbnails
-                        .get(&layer.id)
-                        .is_some_and(|thumbnail| thumbnail.key == revision)
-                    {
-                        return None;
-                    }
-                    let size = [usize::from(pixmap.width()), usize::from(pixmap.height())];
-                    Some((revision, size, pixmap.data_as_u8_slice().to_vec()))
-                }),
+                LayerKind::Paint(_) | LayerKind::Filter(_) => {
+                    canvas.thumbnail(layer.id).and_then(|(revision, pixmap)| {
+                        if self
+                            .thumbnails
+                            .get(&layer.id)
+                            .is_some_and(|thumbnail| thumbnail.key == revision)
+                        {
+                            return None;
+                        }
+                        let size = [usize::from(pixmap.width()), usize::from(pixmap.height())];
+                        Some((revision, size, pixmap.data_as_u8_slice().to_vec()))
+                    })
+                }
                 LayerKind::Group(group) => {
                     self.refresh(ctx, canvas, &group.children, paper);
                     canvas.thumbnail(layer.id).and_then(|(key, pixmap)| {
@@ -382,6 +405,10 @@ impl LayerDock {
         self.folded = self.folded_elsewhere.remove(&to).unwrap_or_default();
         self.renaming = None;
         self.opacity = None;
+        self.filter_edit = None;
+        self.tone_dot_picking = false;
+        self.tone_bg_picking = false;
+        self.tone_color_dirty = false;
         self.dragging = None;
         self.thumbnails.clear();
     }
@@ -398,7 +425,14 @@ impl LayerDock {
         ROW * 2.0 + self.below
     }
 
-    pub fn show(&mut self, ui: &mut Ui, canvas: &mut Canvas, refusal: &mut Option<String>) {
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        canvas: &mut Canvas,
+        refusal: &mut Option<String>,
+        saved_gradients: &mut Vec<crate::settings::SavedGradient>,
+        saved_changed: &mut bool,
+    ) {
         // Rows are drawn before what is done to them is applied, so a change
         // needs another frame to show, on screen and to screen readers.
         let state = |dock: &Self, canvas: &Canvas| {
@@ -410,13 +444,20 @@ impl LayerDock {
             )
         };
         let before = state(self, canvas);
-        self.draw(ui, canvas, refusal);
+        self.draw(ui, canvas, refusal, saved_gradients, saved_changed);
         if state(self, canvas) != before {
             ui.ctx().request_repaint();
         }
     }
 
-    fn draw(&mut self, ui: &mut Ui, canvas: &mut Canvas, refusal: &mut Option<String>) {
+    fn draw(
+        &mut self,
+        ui: &mut Ui,
+        canvas: &mut Canvas,
+        refusal: &mut Option<String>,
+        saved_gradients: &mut Vec<crate::settings::SavedGradient>,
+        saved_changed: &mut bool,
+    ) {
         self.refresh_thumbnails(ui.ctx(), canvas);
         let current = canvas.session().current_layer();
         let mut rows = Vec::new();
@@ -457,7 +498,7 @@ impl LayerDock {
             ui.colored_label(theme::accent_ink(), text);
         }
         ui.add_space(theme::space::XS);
-        self.properties(ui, canvas, current, refusal);
+        self.properties(ui, canvas, current, refusal, saved_gradients, saved_changed);
         let below = ui.cursor().top() - list_end;
         if below != self.below {
             self.below = below;
@@ -746,6 +787,9 @@ impl LayerDock {
             if row.folded.is_some() {
                 badges.push("G");
             }
+            if row.filter {
+                badges.push("F");
+            }
             if row.clipped {
                 badges.push("↳");
             }
@@ -876,6 +920,10 @@ impl LayerDock {
             if text_button(ui, Glyph::Add, "G", tr("layer-add-group"), true).clicked() {
                 chosen = Some(LayerAction::AddGroup);
             }
+            if widgets::icon_button(ui, Glyph::Filter, 16.0, tr("layer-add-filter"), true).clicked()
+            {
+                chosen = Some(LayerAction::AddFilter);
+            }
             if text_button(ui, Glyph::Remove, "G", tr("layer-ungroup"), ungroup).clicked() {
                 chosen = Some(LayerAction::Ungroup);
             }
@@ -937,6 +985,8 @@ impl LayerDock {
         canvas: &mut Canvas,
         current: LayerId,
         refusal: &mut Option<String>,
+        saved_gradients: &mut Vec<crate::settings::SavedGradient>,
+        saved_changed: &mut bool,
     ) {
         let document = canvas.session().document();
         let Some(layer) = document.layer(current) else {
@@ -980,6 +1030,7 @@ impl LayerDock {
                         match &mut layer.kind {
                             LayerKind::Paint(paint) => paint.blend = chosen,
                             LayerKind::Group(group) => group.blend = chosen,
+                            LayerKind::Filter(filter) => filter.blend = chosen,
                         }
                     })
                 }),
@@ -1025,6 +1076,7 @@ impl LayerDock {
                     {
                         LayerKind::Paint(paint) => paint.clip_to_below = clip,
                         LayerKind::Group(group) => group.clip_to_below = clip,
+                        LayerKind::Filter(filter) => filter.clip_to_below = clip,
                     })
                 }),
             );
@@ -1065,12 +1117,295 @@ impl LayerDock {
                     session.update_layer(current, "Layer opacity", |layer| match &mut layer.kind {
                         LayerKind::Paint(paint) => paint.opacity = value,
                         LayerKind::Group(group) => group.opacity = value,
+                        LayerKind::Filter(filter) => filter.opacity = value,
                     })
                 }),
             );
             self.opacity = None;
         }
         self.outline_controls(ui, canvas, current, refusal);
+        self.filter_controls(ui, canvas, current, refusal, saved_gradients, saved_changed);
+    }
+
+    /// Filter layer kind switcher and parameters for `GradientMap` and `Screentone`.
+    fn filter_controls(
+        &mut self,
+        ui: &mut Ui,
+        canvas: &mut Canvas,
+        current: LayerId,
+        refusal: &mut Option<String>,
+        saved_gradients: &mut Vec<crate::settings::SavedGradient>,
+        saved_changed: &mut bool,
+    ) {
+        let Some(LayerKind::Filter(filter)) = canvas
+            .session()
+            .document()
+            .layer(current)
+            .map(|layer| &layer.kind)
+        else {
+            if self
+                .filter_edit
+                .as_ref()
+                .is_some_and(|(id, _, _)| *id == current)
+            {
+                self.filter_edit = None;
+            }
+            return;
+        };
+        let committed_kind = filter.kind.clone();
+        if self
+            .filter_edit
+            .as_ref()
+            .is_none_or(|(id, baseline, _)| *id != current || *baseline != committed_kind)
+        {
+            self.filter_edit = Some((current, committed_kind.clone(), committed_kind.clone()));
+            self.tone_dot_picking = false;
+            self.tone_bg_picking = false;
+            self.tone_color_dirty = false;
+        }
+        let Some((_, _, ref mut edited)) = self.filter_edit else {
+            return;
+        };
+
+        ui.add_space(theme::space::XS);
+        widgets::divider(ui, theme::space::XS);
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum KindTab {
+            GradientMap,
+            Screentone,
+        }
+        let mut tab = match edited {
+            FilterKind::GradientMap { .. } => KindTab::GradientMap,
+            FilterKind::Screentone(_) => KindTab::Screentone,
+        };
+        let before_tab = tab;
+        widgets::segmented(
+            ui,
+            &mut tab,
+            &[
+                (KindTab::GradientMap, tr("filter-gradient-map")),
+                (KindTab::Screentone, tr("filter-screentone")),
+            ],
+            2,
+        );
+        if tab != before_tab {
+            let next = match tab {
+                KindTab::GradientMap => FilterKind::GradientMap {
+                    gradient: Gradient::default(),
+                    dither: Dither::Bayer4,
+                    quantize: QuantizeMode::default(),
+                },
+                KindTab::Screentone => FilterKind::Screentone(Screentone::default()),
+            };
+            self.tone_dot_picking = false;
+            self.tone_bg_picking = false;
+            self.tone_color_dirty = false;
+            self.filter_edit = None;
+            commit_filter_kind(canvas, current, next, refusal);
+            return;
+        }
+        ui.add_space(theme::space::XS);
+
+        match edited {
+            FilterKind::GradientMap {
+                gradient,
+                dither,
+                quantize,
+            } => {
+                let res = super::gradient::editor(
+                    ui,
+                    "filter-grad-map",
+                    &mut self.gradient_editor,
+                    gradient,
+                    dither,
+                    quantize,
+                    saved_gradients,
+                    saved_changed,
+                    None,
+                );
+                if res.committed {
+                    let next = edited.clone();
+                    if next != committed_kind {
+                        commit_filter_kind(canvas, current, next, refusal);
+                        self.filter_edit = None;
+                    }
+                }
+            }
+            FilterKind::Screentone(tone) => {
+                let mut committed_now = false;
+                let mut shape = tone.shape;
+                widgets::form_row(ui, tr("screentone-shape"), |ui| {
+                    egui::ComboBox::from_id_salt("screentone-shape")
+                        .width(ui.available_width())
+                        .selected_text(tone_shape_name(tone.shape))
+                        .show_ui(ui, |ui| {
+                            for candidate in ToneShape::ALL {
+                                widgets::choice(
+                                    ui,
+                                    &mut shape,
+                                    candidate,
+                                    tone_shape_name(candidate),
+                                );
+                            }
+                        })
+                        .response
+                        .widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::ComboBox,
+                                true,
+                                tr("screentone-shape"),
+                            )
+                        });
+                });
+                if shape != tone.shape {
+                    tone.shape = shape;
+                    committed_now = true;
+                }
+
+                let size_label = tr("screentone-size");
+                let size_row = widgets::form_row(ui, size_label, |ui| {
+                    let num = widgets::number(
+                        ui,
+                        &mut tone.size,
+                        dither::limits::TONE_SIZE,
+                        " px",
+                        1,
+                        56.0,
+                        size_label,
+                    );
+                    let width = ui.available_width().max(40.0);
+                    widgets::slider(
+                        ui,
+                        &mut tone.size,
+                        dither::limits::TONE_SIZE,
+                        size_label,
+                        width,
+                    )
+                    .union(num)
+                });
+                tone.size = tone.size.clamp(
+                    *dither::limits::TONE_SIZE.start(),
+                    *dither::limits::TONE_SIZE.end(),
+                );
+                if size_row.drag_stopped() || (size_row.changed() && !size_row.dragged()) {
+                    committed_now = true;
+                }
+
+                if tone.shape != ToneShape::Bayer {
+                    let angle_label = tr("screentone-angle");
+                    let angle_row = widgets::form_row(ui, angle_label, |ui| {
+                        let num = widgets::number(
+                            ui,
+                            &mut tone.angle,
+                            dither::limits::TONE_ANGLE,
+                            "°",
+                            0,
+                            56.0,
+                            angle_label,
+                        );
+                        let width = ui.available_width().max(40.0);
+                        widgets::slider(
+                            ui,
+                            &mut tone.angle,
+                            dither::limits::TONE_ANGLE,
+                            angle_label,
+                            width,
+                        )
+                        .union(num)
+                    });
+                    tone.angle = tone.angle.clamp(
+                        *dither::limits::TONE_ANGLE.start(),
+                        *dither::limits::TONE_ANGLE.end(),
+                    );
+                    if angle_row.drag_stopped() || (angle_row.changed() && !angle_row.dragged()) {
+                        committed_now = true;
+                    }
+                }
+
+                let [dr, dg, db, da] = tone.dot_color.0;
+                let mut dot_col = Color32::from_rgba_unmultiplied(dr, dg, db, da);
+                widgets::form_row(ui, tr("screentone-dot-color"), |ui| {
+                    if widgets::color_swatch(
+                        ui,
+                        dot_col,
+                        tr("screentone-dot-color"),
+                        self.tone_dot_picking,
+                    )
+                    .clicked()
+                    {
+                        self.tone_dot_picking = !self.tone_dot_picking;
+                        if self.tone_dot_picking {
+                            self.tone_bg_picking = false;
+                        }
+                    }
+                });
+                if self.tone_dot_picking
+                    && egui::color_picker::color_picker_color32(
+                        ui,
+                        &mut dot_col,
+                        egui::color_picker::Alpha::OnlyBlend,
+                    )
+                {
+                    tone.dot_color = Rgba8(dot_col.to_srgba_unmultiplied());
+                    self.tone_color_dirty = true;
+                }
+
+                let mut transparent_bg = tone.background.is_none();
+                if widgets::checkbox(ui, &mut transparent_bg, tr("screentone-transparent-bg"))
+                    .changed()
+                {
+                    tone.background = if transparent_bg {
+                        self.tone_bg_picking = false;
+                        None
+                    } else {
+                        Some(Rgba8([255, 255, 255, 255]))
+                    };
+                    committed_now = true;
+                }
+                if let Some(bg) = tone.background.as_mut() {
+                    let [br, bg_g, bb, ba] = bg.0;
+                    let mut bg_col = Color32::from_rgba_unmultiplied(br, bg_g, bb, ba);
+                    widgets::form_row(ui, tr("screentone-bg-color"), |ui| {
+                        if widgets::color_swatch(
+                            ui,
+                            bg_col,
+                            tr("screentone-bg-color"),
+                            self.tone_bg_picking,
+                        )
+                        .clicked()
+                        {
+                            self.tone_bg_picking = !self.tone_bg_picking;
+                            if self.tone_bg_picking {
+                                self.tone_dot_picking = false;
+                            }
+                        }
+                    });
+                    if self.tone_bg_picking
+                        && egui::color_picker::color_picker_color32(
+                            ui,
+                            &mut bg_col,
+                            egui::color_picker::Alpha::OnlyBlend,
+                        )
+                    {
+                        *bg = Rgba8(bg_col.to_srgba_unmultiplied());
+                        self.tone_color_dirty = true;
+                    }
+                }
+
+                if self.tone_color_dirty && !ui.input(|i| i.pointer.any_down()) {
+                    self.tone_color_dirty = false;
+                    committed_now = true;
+                }
+                if committed_now {
+                    let next = edited.clone();
+                    if next != committed_kind {
+                        commit_filter_kind(canvas, current, next, refusal);
+                        self.filter_edit = None;
+                    }
+                }
+            }
+        }
     }
 
     /// A paint layer's outline: whether it has one, how wide and what colour.
@@ -1239,6 +1574,34 @@ fn text_button(
 }
 
 /// Moves `id` to where it was dropped, as one undo step.
+fn tone_shape_name(shape: ToneShape) -> &'static str {
+    tr(match shape {
+        ToneShape::Dot => "screentone-dot",
+        ToneShape::Square => "screentone-square",
+        ToneShape::Line => "screentone-line",
+        ToneShape::Cross => "screentone-cross",
+        ToneShape::Bayer => "screentone-bayer",
+    })
+}
+
+fn commit_filter_kind(
+    canvas: &mut Canvas,
+    id: LayerId,
+    kind: FilterKind,
+    refusal: &mut Option<String>,
+) {
+    report(
+        refusal,
+        canvas.edit(|session| {
+            session.update_layer(id, "Edit filter layer", |layer| {
+                if let LayerKind::Filter(filter) = &mut layer.kind {
+                    filter.kind = kind;
+                }
+            })
+        }),
+    );
+}
+
 fn move_by_drop(session: &mut Session, id: LayerId, target: Drop) -> Result<Outcome, EditError> {
     let document = session.document();
     let (parent, index) = match target {

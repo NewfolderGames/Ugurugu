@@ -10,6 +10,7 @@
 use egui::epaint::{Mesh, Vertex, WHITE_UV};
 use egui::{Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use ugu_core::ops::Rgba8;
+use ugu_core::pattern::{PATTERNS, Pattern, name_of as pattern_name};
 
 use crate::canvas::Canvas;
 use crate::i18n::{tr, tr_with};
@@ -410,13 +411,17 @@ impl ColorDock {
                         .size(theme::SMALL)
                         .color(theme::muted()),
                 );
-                if let Some(typed) = self.hex_field(ui, picked, label.id)
-                    && typed != picked
-                {
-                    self.previous = Some(picked);
-                    self.seen = Some(typed);
-                    canvas.tools_mut().color = typed;
-                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if let Some(typed) = self.hex_field(ui, picked, label.id)
+                        && typed != picked
+                    {
+                        self.previous = Some(picked);
+                        self.seen = Some(typed);
+                        canvas.tools_mut().color = typed;
+                    }
+                    pattern_picker(ui, canvas, picked);
+                });
             });
         });
         let rest = ui.cursor().min.y - top - side;
@@ -438,7 +443,7 @@ impl ColorDock {
             .add(
                 egui::TextEdit::singleline(&mut text)
                     .id(id)
-                    .desired_width(84.0)
+                    .desired_width(76.0)
                     .char_limit(9),
             )
             .labelled_by(label);
@@ -452,6 +457,156 @@ impl ColorDock {
         }
         parse_hex(&typed?, picked.0[3])
     }
+}
+
+fn pattern_label(pattern: Option<Pattern>) -> &'static str {
+    match pattern.and_then(pattern_name) {
+        Some(id) => tr(match id {
+            "dither-12" => "pattern-dither-12",
+            "dither-25" => "pattern-dither-25",
+            "checker-50" => "pattern-checker-50",
+            "dither-75" => "pattern-dither-75",
+            "dither-87" => "pattern-dither-87",
+            "h-stripe-1" => "pattern-h-stripe-1",
+            "h-stripe-2" => "pattern-h-stripe-2",
+            "v-stripe-1" => "pattern-v-stripe-1",
+            "v-stripe-2" => "pattern-v-stripe-2",
+            "diag-right" => "pattern-diag-right",
+            "diag-left" => "pattern-diag-left",
+            "crosshatch-light" => "pattern-crosshatch-light",
+            "crosshatch-dense" => "pattern-crosshatch-dense",
+            "dots-4" => "pattern-dots-4",
+            "bricks-4" => "pattern-bricks-4",
+            "stipple-8" => "pattern-stipple-8",
+            _ => "pattern-solid",
+        }),
+        None => tr("pattern-solid"),
+    }
+}
+
+fn paint_pattern_preview(
+    painter: &egui::Painter,
+    rect: Rect,
+    pattern: Option<Pattern>,
+    ink: Color32,
+    cell: f32,
+) {
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(theme::radius::SMALL),
+        theme::base(),
+    );
+    let Some(pattern) = pattern else {
+        painter.rect_filled(
+            rect.shrink(1.0),
+            CornerRadius::same(theme::radius::SMALL),
+            ink,
+        );
+        return;
+    };
+    let cols = (rect.width() / cell).floor() as i32;
+    let rows = (rect.height() / cell).floor() as i32;
+    for y in 0..rows {
+        for x in 0..cols {
+            if pattern.contains(x, y) {
+                let sq = Rect::from_min_size(
+                    egui::pos2(rect.left() + x as f32 * cell, rect.top() + y as f32 * cell),
+                    egui::vec2(cell, cell),
+                );
+                painter.rect_filled(sq, 0.0, ink);
+            }
+        }
+    }
+}
+
+fn pattern_picker(ui: &mut Ui, canvas: &mut Canvas, primary: Rgba8) {
+    let active = canvas.tools().pattern;
+    let open = egui::Popup::is_id_open(ui.ctx(), ui.id().with("pattern-picker").with("popup"));
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 22.0), Sense::click());
+    let label = tr("pattern-picker");
+    let chosen_name = pattern_label(active);
+    let response = response.on_hover_text(format!("{label}: {chosen_name}"));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            true,
+            format!("{label}: {chosen_name}"),
+        )
+    });
+
+    let ink = Color32::from_rgb(primary.0[0], primary.0[1], primary.0[2]);
+    let inner = rect.shrink(3.0);
+    paint_pattern_preview(ui.painter(), inner, active, ink, 2.0);
+    let stroke = if active.is_some() || open {
+        Stroke::new(2.0, theme::accent())
+    } else {
+        Stroke::new(1.0, theme::border())
+    };
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(theme::radius::SMALL),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    if response.has_focus() {
+        widgets::focus_ring(ui.painter(), rect, theme::radius::SMALL);
+    }
+
+    egui::Popup::menu(&response).show(|ui| {
+        ui.set_min_width(142.0);
+        ui.label(
+            egui::RichText::new(tr("pattern-picker"))
+                .size(theme::SMALL)
+                .color(theme::muted()),
+        );
+        ui.add_space(theme::space::XS);
+        let mut items: Vec<(Option<Pattern>, &'static str)> =
+            Vec::with_capacity(1 + PATTERNS.len());
+        items.push((None, tr("pattern-solid")));
+        for preset in PATTERNS {
+            items.push((Some(preset.pattern), pattern_label(Some(preset.pattern))));
+        }
+        let mut selected = None;
+        for row in items.chunks(4) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for &(pat, name) in row {
+                    let (tile, tile_resp) =
+                        ui.allocate_exact_size(egui::vec2(32.0, 32.0), Sense::click());
+                    let tile_resp = tile_resp.on_hover_text(name);
+                    let is_active = active == pat;
+                    tile_resp.widget_info(|| {
+                        egui::WidgetInfo::selected(egui::WidgetType::Button, true, is_active, name)
+                    });
+                    paint_pattern_preview(ui.painter(), tile.shrink(3.0), pat, ink, 3.0);
+                    let border = if is_active {
+                        Stroke::new(2.0, theme::accent())
+                    } else if tile_resp.hovered() {
+                        Stroke::new(1.5, theme::text())
+                    } else {
+                        Stroke::new(1.0, theme::border())
+                    };
+                    ui.painter().rect_stroke(
+                        tile,
+                        CornerRadius::same(theme::radius::SMALL),
+                        border,
+                        egui::StrokeKind::Inside,
+                    );
+                    if tile_resp.has_focus() {
+                        widgets::focus_ring(ui.painter(), tile, theme::radius::SMALL);
+                    }
+                    if tile_resp.clicked() {
+                        selected = Some(pat);
+                    }
+                }
+            });
+            ui.add_space(4.0);
+        }
+        if let Some(next) = selected {
+            canvas.tools_mut().pattern = next;
+            ui.close();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -651,5 +806,27 @@ mod tests {
         for wrong in ["", "#", "#12345", "#1234567", "#GG0000", "#+1FF00"] {
             assert_eq!(parse_hex(wrong, 255), None, "{wrong}");
         }
+    }
+
+    #[test]
+    fn pattern_picker_exposes_accesskit_button_and_presets() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut dock = ColorDock::default();
+        let mut canvas = Canvas::new(ugu_core::document::Document::new([32, 32]), |_| {});
+        let mut field = ColorField::Square;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            dock.show(ui, &mut canvas, &mut field, None);
+        });
+        output.textures_delta.clear();
+        let update = output.platform_output.accesskit_update.expect("accesskit");
+        let label_prefix = tr("pattern-picker");
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, n)| n.label().is_some_and(|l| l.starts_with(label_prefix)))
+        );
+        assert_eq!(PATTERNS.len(), 16);
     }
 }

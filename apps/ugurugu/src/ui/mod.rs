@@ -13,6 +13,7 @@ mod brushes;
 mod color;
 mod dock;
 mod focus;
+mod gradient;
 mod help;
 mod history;
 #[cfg(test)]
@@ -58,6 +59,10 @@ pub struct Panels {
     pub color: color::ColorDock,
     pub navigator: navigator::Navigator,
     presets: brushes::Presets,
+    gradient_editor: gradient::GradientEditorState,
+    pub gradients: Vec<crate::settings::SavedGradient>,
+    pub gradients_loaded: bool,
+    pub gradients_changed: bool,
     /// Where the panels are, and whether they and the animation bar are
     /// open.
     pub layout: Layout,
@@ -359,6 +364,7 @@ pub fn rail(
         (Tool::Select, Action::Select, "tool-select"),
         (Tool::Wand, Action::Wand, "tool-wand"),
         (Tool::Fill, Action::Fill, "tool-fill"),
+        (Tool::Gradient, Action::Gradient, "tool-gradient-rail"),
         (Tool::Text, Action::Text, "tool-text-rail"),
         (Tool::Shape, Action::Shape, "tool-shape-rail"),
         (Tool::Symmetry, Action::SymmetryRuler, "tool-symmetry-rail"),
@@ -411,6 +417,7 @@ pub fn tool_settings(ui: &mut egui::Ui, canvas: &mut Canvas, panels: &mut Panels
     match tool {
         Tool::Select => return selection_settings(ui, canvas),
         Tool::Wand | Tool::Fill => return fill_settings(ui, canvas, tool == Tool::Fill),
+        Tool::Gradient => return gradient_settings(ui, canvas, panels),
         Tool::Text => return text::settings(ui, canvas),
         Tool::Move => return motion::settings(ui, canvas, &panels.keys),
         Tool::Symmetry => return symmetry_settings(ui, canvas),
@@ -437,6 +444,7 @@ pub fn tool_settings(ui: &mut egui::Ui, canvas: &mut Canvas, panels: &mut Panels
         | Tool::Select
         | Tool::Wand
         | Tool::Fill
+        | Tool::Gradient
         | Tool::Text
         | Tool::Eyedropper
         | Tool::Shape
@@ -519,6 +527,32 @@ pub fn tool_settings(ui: &mut egui::Ui, canvas: &mut Canvas, panels: &mut Panels
     // A preset chosen sets the width and stabilizer shown above it.
     if *canvas.brushes().get(tool) != settings {
         ui.ctx().request_repaint();
+    }
+}
+
+/// The symmetry ruler of the document shown.
+fn gradient_settings(ui: &mut egui::Ui, canvas: &mut Canvas, panels: &mut Panels) {
+    widgets::panel_heading(ui, tr("tool-gradient"));
+    let pen_color = canvas.tools().color;
+    let mut g = canvas.tools().gradient.clone();
+    let res = gradient::editor(
+        ui,
+        "tool-gradient",
+        &mut panels.gradient_editor,
+        &mut g.gradient,
+        &mut g.dither,
+        &mut g.quantize,
+        &mut panels.gradients,
+        &mut panels.gradients_changed,
+        Some(gradient::ToolGradientControls {
+            shape: &mut g.shape,
+            opacity: &mut g.opacity,
+            use_pen_color: &mut g.use_pen_color,
+            pen_color,
+        }),
+    );
+    if res.changed {
+        canvas.tools_mut().gradient = g;
     }
 }
 
@@ -892,7 +926,7 @@ pub fn pick_cursor(ui: &mut egui::Ui, canvas: &Canvas) {
                 .layer_id_at(pointer)
                 .is_none_or(|layer| layer.order == egui::Order::Background)
     });
-    if over && canvas.picks_with(alt) {
+    if over && (canvas.picks_with(alt) || canvas.tool() == Tool::Gradient) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
     }
 }
@@ -1155,6 +1189,22 @@ fn corners_on_screen(ui: &egui::Ui, canvas: &Canvas, rect: [f64; 4]) -> [egui::P
 }
 
 /// The symmetry ruler's lines and centre, when it is on.
+pub fn gradient_overlay(ui: &mut egui::Ui, canvas: &Canvas) {
+    let Some(live) = canvas.session().live_gradient() else {
+        return;
+    };
+    let a = to_screen(ui, canvas, live.from);
+    let b = to_screen(ui, canvas, live.to);
+    let painter = ui.painter();
+    let edge = theme::accent_text().gamma_multiply(0.75);
+    painter.line_segment([a, b], egui::Stroke::new(3.0, edge));
+    painter.line_segment([a, b], egui::Stroke::new(1.5, theme::accent()));
+    for p in [a, b] {
+        painter.circle_filled(p, 5.0, theme::base());
+        painter.circle_stroke(p, 5.0, egui::Stroke::new(2.0, theme::accent()));
+    }
+}
+
 pub fn symmetry_overlay(ui: &mut egui::Ui, canvas: &Canvas) {
     let lines = canvas.symmetry_lines();
     let Some(&[centre, _]) = lines.first() else {
@@ -1742,9 +1792,13 @@ pub fn navigator(ui: &mut egui::Ui, canvas: &mut Canvas, panels: &mut Panels, ro
 
 pub fn layers(ui: &mut egui::Ui, canvas: &mut Canvas, panels: &mut Panels) {
     let Panels {
-        layers, refusal, ..
+        layers,
+        refusal,
+        gradients,
+        gradients_changed,
+        ..
     } = panels;
-    layers.show(ui, canvas, refusal);
+    layers.show(ui, canvas, refusal, gradients, gradients_changed);
 }
 
 /// The animation bar: play, the frame and frame count, the animation

@@ -19,12 +19,14 @@ use ugu_core::document::{Document, LayerId, LayerKind};
 use ugu_core::edit::{EditError, Outcome};
 use ugu_core::motion::frame_in_cycle;
 use ugu_core::ops::{MergeRefusal, Op};
+use ugu_core::pattern::Pattern;
 use ugu_core::selection::Combine;
 use ugu_core::store::StoreError;
 use ugu_platform::clock::{self, Ticks};
 use ugu_platform::pointer::{PointerKind, PointerSample};
-use ugu_render::compose::{Split, Stamp, composite};
+use ugu_render::compose::{Split, Stamp, composite, composite_pixmap};
 use ugu_render::document::{FULL_DETAIL, Purpose, TILE_EDGE, scaled_size, surface_estimate};
+use ugu_render::gradient::GradientDraw;
 use ugu_render::live::{LiveStroke, Spare};
 use ugu_render::plan::{Reference, RenderPlan};
 use ugu_render::raster::PixelRect;
@@ -130,6 +132,11 @@ enum Interaction {
     },
     /// Dragging a shape with the selection tool; the session holds it.
     Selecting,
+    /// Dragging a gradient on the active layer; `pixmap` holds the current preview.
+    Gradienting {
+        pixmap: Option<(PixelRect, Pixmap)>,
+        rect: Option<PixelRect>,
+    },
     /// Dragging the transform box from `start` (document pixels), which had
     /// `base` then.
     Transforming {
@@ -955,7 +962,12 @@ impl Canvas {
     /// Asks for the thumbnails of layers whose pixels changed since theirs
     /// were drawn, unless some are already on their way.
     fn sync_thumbnails(&mut self) {
-        if self.tab.thumbnails_asked || matches!(self.interaction, Interaction::Drawing { .. }) {
+        if self.tab.thumbnails_asked
+            || matches!(
+                self.interaction,
+                Interaction::Drawing { .. } | Interaction::Gradienting { .. }
+            )
+        {
             return;
         }
         let revisions = self.tab.session.layer_revisions();
@@ -1296,7 +1308,15 @@ impl Canvas {
             return;
         };
         let drawn = drawn(&self.interaction);
-        composite(split, &drawn, rect, &mut self.tab.display);
+        if let Interaction::Gradienting {
+            pixmap: Some((pix_rect, pix)),
+            ..
+        } = &self.interaction
+        {
+            composite_pixmap(split, *pix_rect, pix, rect, &mut self.tab.display);
+        } else {
+            composite(split, &drawn, rect, &mut self.tab.display);
+        }
         self.tab.onion.cover(&mut self.tab.display, rect);
         self.upload = union(self.upload, Some(rect));
     }
@@ -1383,6 +1403,13 @@ impl Canvas {
                 let point = self.to_document(sample.position);
                 self.click_area(point);
             }
+            CanvasInput::Begin(Gesture::Draw, kind, sample)
+                if self.tools.tool == Tool::Gradient
+                    && !(kind == PointerKind::Pen && sample.inverted) =>
+            {
+                self.sample_count += 1;
+                self.begin_gradient(&sample);
+            }
             // The eraser end of a pen erases, as with any tool.
             CanvasInput::Begin(Gesture::Draw, kind, sample)
                 if self.tools.tool == Tool::Shape
@@ -1405,6 +1432,7 @@ impl Canvas {
                     }
                     Interaction::Drawing { shape: true, .. } => self.drag_shape(&sample),
                     Interaction::Drawing { .. } => self.extend_stroke(&sample),
+                    Interaction::Gradienting { .. } => self.drag_gradient(sample.position),
                     Interaction::Selecting => {
                         let point = self.to_document(sample.position);
                         self.tab.session.extend_selection(point);
@@ -1442,6 +1470,9 @@ impl Canvas {
                             self.tab.session.end_stroke(point)
                         };
                         self.end_drawing(before, had, outcome, live, copies, rect);
+                    }
+                    Interaction::Gradienting { rect, .. } => {
+                        self.end_gradient(sample.position, rect);
                     }
                     Interaction::Selecting => {
                         let point = self.to_document(sample.position);
@@ -1515,6 +1546,10 @@ impl Canvas {
         match std::mem::replace(&mut self.interaction, Interaction::Idle) {
             Interaction::Drawing { rect, .. } => {
                 self.tab.session.cancel_stroke();
+                self.recomposite(rect);
+            }
+            Interaction::Gradienting { rect, .. } => {
+                self.tab.session.cancel_gradient();
                 self.recomposite(rect);
             }
             Interaction::Selecting => {
@@ -1734,15 +1769,15 @@ impl Canvas {
         let after = self.key();
         let document = self.tab.session.document();
         let added = match self.tab.split.as_mut() {
-            Some((key, split)) if *key == before && after.layer == before.layer => {
-                last_fill(document, after.layer).and_then(
-                    |(coverage, clip, antialias, color, behind)| {
-                        let changed = split.stamp_fill(coverage, clip, antialias, color, behind);
-                        *key = after;
-                        changed
-                    },
-                )
-            }
+            Some((key, split)) if *key == before && after.layer == before.layer => last_fill(
+                document,
+                after.layer,
+            )
+            .and_then(|(coverage, clip, antialias, color, behind, pattern)| {
+                let changed = split.stamp_fill(coverage, clip, antialias, color, behind, pattern);
+                *key = after;
+                changed
+            }),
             _ => None,
         };
         self.recomposite(added);
@@ -1751,8 +1786,11 @@ impl Canvas {
     /// Why the current layer cannot be drawn on when it is no paint layer,
     /// in 2.2.13's words.
     fn no_paint_layer(&self) -> &'static str {
-        if self.tab.session.document().layers.is_empty() {
+        let session = &self.tab.session;
+        if session.document().layers.is_empty() {
             tr("draw-no-layer")
+        } else if session.is_filter_layer(session.current_layer()) {
+            tr("draw-on-filter")
         } else {
             tr("draw-on-group")
         }
@@ -1835,26 +1873,111 @@ impl Canvas {
         }
     }
 
+    fn report_stroke_refusal(&mut self, error: StrokeRefused) {
+        self.notice = Some(
+            match error {
+                StrokeRefused::Pending => tr("restyle-pending"),
+                StrokeRefused::HiddenLayer => self.hidden_layer(),
+                StrokeRefused::NoLayer => self.no_paint_layer(),
+                StrokeRefused::OutsideSelection => tr("draw-outside-selection"),
+            }
+            .to_owned(),
+        );
+    }
+
+    fn begin_gradient(&mut self, sample: &PointerSample) {
+        self.notice = None;
+        self.pause_playback();
+        let point = self.to_document(sample.position);
+        if let Err(error) = self.tab.session.begin_gradient(&self.tools, point) {
+            self.report_stroke_refusal(error);
+            return;
+        }
+        self.interaction = Interaction::Gradienting {
+            pixmap: None,
+            rect: None,
+        };
+    }
+
+    fn drag_gradient(&mut self, position: [f64; 2]) {
+        let point = self.to_document(position);
+        let snap = self.modifiers.0;
+        if !self.tab.session.drag_gradient(point, snap) {
+            return;
+        }
+        let Some(live) = self.tab.session.live_gradient() else {
+            return;
+        };
+        let (from, to) = live.layer_endpoints();
+        let clip_mask = live.clip.as_ref().map(|selection| selection.mask().clone());
+        let draw = GradientDraw {
+            gradient: live.gradient.clone(),
+            shape: live.shape,
+            from,
+            to,
+            dither: live.dither,
+            quantize: live.quantize,
+            opacity: live.opacity,
+        };
+        let canvas_size = self.tab.session.document().canvas;
+        let next_bounds = draw.bounds(clip_mask.as_ref(), canvas_size);
+        let next_pixmap =
+            next_bounds.map(|bounds| (bounds, draw.render_rect(bounds, clip_mask.as_ref(), 1)));
+        let prev_rect = match &mut self.interaction {
+            Interaction::Gradienting { pixmap, rect } => {
+                *pixmap = next_pixmap;
+                std::mem::replace(rect, next_bounds)
+            }
+            _ => None,
+        };
+        self.recomposite(union(prev_rect, next_bounds));
+    }
+
+    fn end_gradient(&mut self, position: [f64; 2], prev_rect: Option<PixelRect>) {
+        let point = self.to_document(position);
+        let snap = self.modifiers.0;
+        let before = self.key();
+        let had = layer_ops(self.tab.session.document(), before.layer).len();
+        let outcome = self.tab.session.end_gradient(point, snap);
+        self.record_colors();
+        match outcome {
+            Ok(Outcome::Committed(_)) => {
+                if self.tools.gradient.use_pen_color {
+                    self.tools.colors.record(self.tools.color);
+                }
+            }
+            Ok(Outcome::NoChange) => return self.recomposite(prev_rect),
+            Err(error) => {
+                self.notice = Some(failed_because(tr("stroke-failed"), &error));
+                return self.recomposite(prev_rect);
+            }
+        }
+        let after = self.key();
+        let document = self.tab.session.document();
+        let added = match self.tab.split.as_mut() {
+            Some((key, split)) if *key == before && after.layer == before.layer => {
+                let mut changed = None;
+                let ops = layer_ops(document, after.layer)
+                    .get(had..)
+                    .unwrap_or_default();
+                for op in ops {
+                    if let Some((draw, clip)) = op_gradient(document, op) {
+                        changed = union(changed, split.stamp_gradient(&draw, clip));
+                    }
+                }
+                *key = after;
+                changed
+            }
+            _ => None,
+        };
+        self.recomposite(union(prev_rect, added));
+    }
+
     /// Shows the stroke the session has `begun`, or says why there is none.
     fn start_drawing(&mut self, begun: Result<(), StrokeRefused>, shape: bool) {
-        match begun {
-            Ok(()) => {}
-            Err(StrokeRefused::Pending) => {
-                self.notice = Some(tr("restyle-pending").to_owned());
-                return;
-            }
-            Err(StrokeRefused::HiddenLayer) => {
-                self.notice = Some(self.hidden_layer().to_owned());
-                return;
-            }
-            Err(StrokeRefused::NoLayer) => {
-                self.notice = Some(self.no_paint_layer().to_owned());
-                return;
-            }
-            Err(StrokeRefused::OutsideSelection) => {
-                self.notice = Some(tr("draw-outside-selection").to_owned());
-                return;
-            }
+        if let Err(error) = begun {
+            self.report_stroke_refusal(error);
+            return;
         }
         let spare = self.spare_coverage.pop();
         let mut stroke = self.live_stroke(spare).drawn_whole(shape);
@@ -1906,6 +2029,7 @@ impl Canvas {
             spare,
         )
         .with_clip(live.clip.as_ref().map(|selection| selection.mask().clone()))
+        .with_pattern((!live.erase).then_some(template.pattern).flatten())
     }
 
     /// Drags the shape to `sample`; the next frame shows it.
@@ -2056,12 +2180,12 @@ impl Canvas {
                 for (index, op) in ops.iter().enumerate() {
                     if let Some(stroke) = op_stroke(document, op) {
                         strokes.push(stroke);
-                    } else if let Some((coverage, clip, antialias, color, behind)) =
+                    } else if let Some((coverage, clip, antialias, color, behind, pattern)) =
                         op_fill(document, op)
                     {
                         changed = union(
                             changed,
-                            split.stamp_fill(coverage, clip, antialias, color, behind),
+                            split.stamp_fill(coverage, clip, antialias, color, behind, pattern),
                         );
                     }
                     let next_is_stroke = ops
@@ -2353,13 +2477,15 @@ fn committed(outcome: Outcome) -> bool {
     matches!(outcome, Outcome::Committed(_))
 }
 
-/// A fill's coverage, clip, antialiasing, colour and whether it goes behind.
+/// A fill's coverage, clip, antialiasing, colour, whether it goes behind, and
+/// optional 1-bit pattern.
 type FillParts<'a> = (
     &'a ugu_core::store::Mask,
     Option<&'a ugu_core::store::Mask>,
     bool,
     [u8; 4],
     bool,
+    Option<Pattern>,
 );
 
 /// The fill on top of `layer`'s operations.
@@ -2375,6 +2501,7 @@ fn op_fill<'a>(document: &'a Document, op: &Op) -> Option<FillParts<'a>> {
         antialias,
         clip,
         behind,
+        pattern,
     } = op
     else {
         return None;
@@ -2384,7 +2511,50 @@ fn op_fill<'a>(document: &'a Document, op: &Op) -> Option<FillParts<'a>> {
         Some(mask) => Some(masks.get(mask)?),
         None => None,
     };
-    Some((masks.get(coverage)?, clip, *antialias, color.0, *behind))
+    Some((
+        masks.get(coverage)?,
+        clip,
+        *antialias,
+        color.0,
+        *behind,
+        *pattern,
+    ))
+}
+
+fn op_gradient<'a>(
+    document: &'a Document,
+    op: &Op,
+) -> Option<(GradientDraw, Option<&'a ugu_core::store::Mask>)> {
+    let Op::Gradient {
+        gradient,
+        shape,
+        from,
+        to,
+        dither,
+        quantize,
+        opacity,
+        clip,
+    } = op
+    else {
+        return None;
+    };
+    let stored = document.store.gradients.get(gradient)?;
+    let clip = match clip {
+        Some(mask) => Some(document.store.masks.get(mask)?),
+        None => None,
+    };
+    Some((
+        GradientDraw {
+            gradient: stored.clone(),
+            shape: *shape,
+            from: *from,
+            to: *to,
+            dither: *dither,
+            quantize: *quantize,
+            opacity: *opacity,
+        },
+        clip,
+    ))
 }
 
 /// Calls `each` with every paint layer's id, inside groups too.
@@ -2405,11 +2575,18 @@ fn thumbnail_keys(
                 thumbnail_keys(&group.children, revisions, each).hash(&mut hasher);
                 hasher.finish()
             }
+            LayerKind::Filter(_) => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                revisions.of(layer.id).hash(&mut hasher);
+                all.finish().hash(&mut hasher);
+                hasher.finish()
+            }
         };
         each(layer.id, key);
         let (opacity, blend, clip) = match &layer.kind {
             LayerKind::Paint(paint) => (paint.opacity, paint.blend, paint.clip_to_below),
             LayerKind::Group(group) => (group.opacity, group.blend, group.clip_to_below),
+            LayerKind::Filter(filter) => (filter.opacity, filter.blend, filter.clip_to_below),
         };
         (
             layer.id.0,
@@ -4346,7 +4523,7 @@ mod tests {
             let layer = canvas.session().current_layer();
             match &canvas.session().document().layer(layer).unwrap().kind {
                 LayerKind::Paint(paint) => paint.ops.len(),
-                LayerKind::Group(_) => unreachable!(),
+                LayerKind::Group(_) | LayerKind::Filter(_) => unreachable!(),
             }
         };
 
@@ -4781,5 +4958,68 @@ mod tests {
         assert!(full_render(&canvas).data_as_u8_slice() == full.data_as_u8_slice());
         canvas.set_onion_skin(false);
         assert!(canvas.display().data_as_u8_slice() == full.data_as_u8_slice());
+    }
+
+    #[test]
+    fn gradient_tool_previews_commits_cancels_and_refuses_filter_layer() {
+        let (mut canvas, renders) = animated_canvas();
+        canvas.set_tool(Tool::Gradient).unwrap();
+        settle(&mut canvas, &renders);
+
+        // Escape cancels a drag without changing the document.
+        canvas.apply(CanvasInput::Begin(
+            Gesture::Draw,
+            PointerKind::Mouse,
+            press(10.0, 10.0),
+        ));
+        canvas.apply(CanvasInput::Extend(press(90.0, 50.0)));
+        assert!(canvas.session().live_gradient().is_some());
+        canvas.escape();
+        assert!(canvas.session().live_gradient().is_none());
+        assert_eq!(canvas.session().undo_label(), None);
+
+        // Dragging and releasing commits the gradient matching a full render.
+        canvas.apply(CanvasInput::Begin(
+            Gesture::Draw,
+            PointerKind::Mouse,
+            press(10.0, 20.0),
+        ));
+        canvas.set_modifiers(true, false);
+        canvas.apply(CanvasInput::Extend(press(90.0, 24.0)));
+        canvas.apply(CanvasInput::End(press(90.0, 24.0)));
+        canvas.set_modifiers(false, false);
+        assert_eq!(canvas.session().undo_label(), Some("Gradient"));
+        assert!(canvas.display().data_as_u8_slice() == full_render(&canvas).data_as_u8_slice());
+
+        // Drawing or gradienting on a filter layer shows a refusal notice.
+        canvas
+            .edit(|s| s.add_filter_layer(ugu_core::ops::FilterKind::default()))
+            .unwrap();
+        settle(&mut canvas, &renders);
+        canvas.apply(CanvasInput::Begin(
+            Gesture::Draw,
+            PointerKind::Mouse,
+            press(10.0, 10.0),
+        ));
+        assert_eq!(canvas.notice(), Some(tr("draw-on-filter")));
+    }
+
+    #[test]
+    fn pattern_applies_to_live_and_committed_pen_and_fill() {
+        let (mut canvas, renders) = animated_canvas();
+        canvas.tools.pattern = Some(ugu_core::pattern::find("checker-50").unwrap().pattern);
+        canvas.tools.color = ugu_core::ops::Rgba8([20, 40, 200, 255]);
+        settle(&mut canvas, &renders);
+        stroke_through(&mut canvas, &[[15.0, 15.0], [50.0, 40.0]]);
+        assert!(canvas.display().data_as_u8_slice() == full_render(&canvas).data_as_u8_slice());
+        canvas.set_tool(Tool::Fill).unwrap();
+        canvas.apply(CanvasInput::Begin(
+            Gesture::Draw,
+            PointerKind::Mouse,
+            press(80.0, 20.0),
+        ));
+        canvas.apply(CanvasInput::End(press(80.0, 20.0)));
+        settle(&mut canvas, &renders);
+        assert!(canvas.display().data_as_u8_slice() == full_render(&canvas).data_as_u8_slice());
     }
 }

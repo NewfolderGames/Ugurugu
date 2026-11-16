@@ -836,6 +836,7 @@ mod tests {
                     width: 1.0,
                     brush,
                     seed: index as u64,
+                    pattern: None,
                 },
             );
             ops.push(Op::Paint {

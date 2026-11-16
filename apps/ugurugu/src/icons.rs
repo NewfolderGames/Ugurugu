@@ -61,6 +61,10 @@ pub enum Glyph {
     MirrorView = 44,
     /// Changing the strokes in the selection, not the brush tool.
     Restyle = 45,
+    /// The canvas gradient tool.
+    Gradient = 46,
+    /// Adding a filter layer.
+    Filter = 47,
 }
 
 /// A diamond, as a key is drawn on a timeline.
@@ -469,6 +473,31 @@ fn shapes(glyph: Glyph) -> Shapes {
                     })
                     .collect(),
             );
+        }
+        Glyph::Gradient => {
+            lines.push(vec![
+                [4.4, 4.4],
+                [19.6, 4.4],
+                [19.6, 19.6],
+                [4.4, 19.6],
+                [4.4, 4.4],
+            ]);
+            lines.push(vec![[4.4, 14.0], [14.0, 4.4]]);
+            lines.push(vec![[4.4, 19.6], [19.6, 4.4]]);
+            shapes
+                .fills
+                .push(vec![[19.6, 9.6], [19.6, 19.6], [9.6, 19.6]]);
+        }
+        Glyph::Filter => {
+            lines.push(vec![
+                [4.2, 5.4],
+                [19.8, 5.4],
+                [14.0, 12.2],
+                [14.0, 18.8],
+                [10.0, 20.6],
+                [10.0, 12.2],
+                [4.2, 5.4],
+            ]);
         }
     }
     shapes

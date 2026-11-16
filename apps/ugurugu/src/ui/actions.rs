@@ -78,6 +78,7 @@ pub const SELECT: &[Entry] = &[
 pub const LAYER: &[Entry] = &[
     Do(A::AddLayer),
     Do(A::AddGroup),
+    Do(A::AddFilterLayer),
     Do(A::Ungroup),
     Gap,
     Do(A::DuplicateLayer),
@@ -124,6 +125,7 @@ pub const TOOLS: &[Entry] = &[
     Do(A::Select),
     Do(A::Wand),
     Do(A::Fill),
+    Do(A::Gradient),
     Do(A::Text),
     Do(A::Eyedropper),
     Do(A::Shape),
@@ -314,6 +316,7 @@ pub fn tool(action: Action) -> Option<Tool> {
         A::Select => Tool::Select,
         A::Wand => Tool::Wand,
         A::Fill => Tool::Fill,
+        A::Gradient => Tool::Gradient,
         A::Text => Tool::Text,
         A::Eyedropper => Tool::Eyedropper,
         A::Shape => Tool::Shape,
@@ -327,6 +330,7 @@ fn layer_action(action: Action) -> Option<LayerAction> {
     Some(match action {
         A::AddLayer => LayerAction::Add,
         A::AddGroup => LayerAction::AddGroup,
+        A::AddFilterLayer => LayerAction::AddFilter,
         A::Ungroup => LayerAction::Ungroup,
         A::DuplicateLayer => LayerAction::Duplicate,
         A::MergeDown => LayerAction::MergeDown,
@@ -522,11 +526,13 @@ pub fn glyph(action: Action) -> Option<Glyph> {
         A::Select => Glyph::Lasso,
         A::Wand => Glyph::Wand,
         A::Fill => Glyph::Bucket,
+        A::Gradient => Glyph::Gradient,
         A::Text => Glyph::Text,
         A::Shape => Glyph::Shape,
         A::SymmetryRuler => Glyph::Symmetry,
         A::MoveLayer => Glyph::MoveLayer,
         A::Eyedropper => Glyph::Eyedropper,
+        A::AddFilterLayer => Glyph::Filter,
         _ => return None,
     })
 }
@@ -733,6 +739,7 @@ pub fn run(
         | A::Select
         | A::Wand
         | A::Fill
+        | A::Gradient
         | A::Text
         | A::Eyedropper
         | A::Shape
@@ -747,6 +754,7 @@ pub fn run(
         | A::Navigator
         | A::AddLayer
         | A::AddGroup
+        | A::AddFilterLayer
         | A::Ungroup
         | A::DuplicateLayer
         | A::MergeDown

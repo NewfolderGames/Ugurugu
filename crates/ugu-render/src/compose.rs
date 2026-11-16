@@ -779,6 +779,62 @@ pub fn composite(split: &Split, live: &[&LiveStroke], rect: PixelRect, out: &mut
     }
 }
 
+/// Composites `split` over `rect`, blending `pixmap` (located at `pixmap_rect`)
+/// `src_over` onto the edited layer's source surface without mutating it.
+pub fn composite_pixmap(
+    split: &Split,
+    pixmap_rect: PixelRect,
+    pixmap: &Pixmap,
+    rect: PixelRect,
+    out: &mut Pixmap,
+) {
+    let sources = split.sources();
+    let [left, top, right, bottom] = rect;
+    let threads = if (right - left) * (bottom - top) > 65_536 {
+        std::thread::available_parallelism().map_or(1, |count| count.get().min(8))
+    } else {
+        1
+    };
+    let Some(source) = split.edited else {
+        composite::evaluate(
+            &split.puts,
+            split.background,
+            &sources,
+            rect,
+            out,
+            threads,
+            None,
+        );
+        return;
+    };
+    let [pl, pt, pr, pb] = pixmap_rect;
+    let pw = usize::from(pixmap.width());
+    let src = pixmap.data_as_u8_slice();
+    let apply = |x: usize, y: usize, pixel: &mut [u8; 4]| {
+        let (x, y) = (x as u32, y as u32);
+        if (pl..pr).contains(&x) && (pt..pb).contains(&y) {
+            let at = ((y - pt) as usize * pw + (x - pl) as usize) * 4;
+            let s = &src[at..at + 4];
+            if s[3] != 0 {
+                src_over(pixel, s);
+            }
+        }
+    };
+    let overlay = Overlay {
+        source,
+        apply: &apply,
+    };
+    composite::evaluate_with(
+        &split.puts,
+        split.background,
+        &sources,
+        rect,
+        out,
+        threads,
+        &overlay,
+    );
+}
+
 /// The pixels a full render draws a layer of `surface` in, when its
 /// strokes reach the tiles `reached`.
 fn drawn_in(surface: &TiledSurface, reached: [u32; 4]) -> PixelRect {

@@ -667,3 +667,83 @@ mac-show-all | Show All | 모두 보기 | すべてを表示 | 全部显示
 mac-minimize | Minimize | 최소화 | しまう | 最小化
 mac-zoom | Zoom | 확대/축소 | 拡大/縮小 | 缩放
 mac-bring-to-front | Bring All to Front | 모두 앞으로 가져오기 | すべてを手前に移動 | 前置全部窗口
+
+# Gradient, Dithering, Filter Layers, and Patterns
+tool-gradient | Gra&dient | 그라데이션(&D) | グラデーション(&D) | 渐变(&D)
+tool-gradient-rail | Gradient | 그라데이션 | グラデーション | 渐变
+layer-add-filter | Add filter layer | 필터 레이어 추가 | フィルターレイヤーを追加 | 添加滤镜图层
+filter-name | Filter %1 | 필터 %1 | フィルター %1 | 滤镜 %1 | args=number
+draw-on-filter | Filter layers can't be painted on. Select a paint layer to draw. | 필터 레이어에는 그릴 수 없습니다. 그리려면 페인트 레이어를 선택하세요. | フィルターレイヤーには描画できません。描画するにはペイントレイヤーを選択してください。 | 不能在滤镜图层上绘制。请选择一个绘画图层。
+confirm | Confirm | 확인 | 確定 | 确定
+cancel | Cancel | 취소 | キャンセル | 取消
+gradient-custom | Custom | 사용자 정의 | カスタム | 自定义
+gradient-shape-linear | Linear | 선형 | 線形 | 线性
+gradient-shape-radial | Radial | 방사형 | 円形 | 径向
+gradient-use-pen-color | Use pen color | 펜 색 사용 | ペンの色を使う | 使用画笔颜色
+gradient-presets | Gradient preset | 그라데이션 프리셋 | グラデーションプリセット | 渐变预设
+gradient-reverse | Reverse gradient stops | 그라데이션 반전 | グラデーションを反転 | 反转渐变色标
+gradient-save-preset | Save gradient preset | 그라데이션 프리셋 저장 | グラデーションプリセットを保存 | 保存渐变预设
+gradient-default-name | New gradient | 새 그라데이션 | 新しいグラデーション | 新建渐变
+gradient-delete-preset | Delete gradient preset | 그라데이션 프리셋 삭제 | グラデーションプリセットを削除 | 删除渐变预设
+gradient-save-name | Preset name | 프리셋 이름 | プリセット名 | 预设名称
+gradient-ramp | Gradient ramp | 그라데이션 램프 | グラデーションバー | 渐变色带
+gradient-ramp-tip | Click bar to add stop; drag handles to adjust | 막대를 클릭해 정지점을 추가하고 손잡이를 끌어 조절합니다 | バーをクリックして色停止点を追加し、ハンドルをドラッグして調整します | 点击色带添加色标；拖动手柄调整位置
+gradient-stop-color | Stop color | 정지점 색 | 停止点の色 | 色标颜色
+gradient-stop-color-tip | Choose the color and alpha for this stop | 이 정지점의 색과 알파를 선택합니다 | この停止点の色と不透明度を選びます | 选择此色标的颜色与透明度
+gradient-stop-position | Stop position | 정지점 위치 | 停止点の位置 | 色标位置
+gradient-stop-remove | Remove stop | 정지점 삭제 | 停止点を削除 | 删除色标
+gradient-preset-bw | Black to white | 검정에서 흰색 | 黒から白 | 黑到白
+gradient-preset-fg-transparent | Foreground to transparent | 전경색에서 투명 | 前景色から透明 | 前景色到透明
+gradient-preset-sunset | Sunset | 석양 | 夕焼け | 日落
+gradient-preset-ocean | Ocean | 바다 | 海 | 海洋
+gradient-preset-heat | Heat map | 열지도 | ヒートマップ | 热力图
+gradient-preset-sepia | Sepia | 세피아 | セピア | 复古褐
+gradient-preset-gameboy | Classic 4-tone | 클래식 4색 | クラシック4色 | 经典四色
+dither-mode | Dithering | 디더링 | ディザリング | 抖动
+dither-none | None | 없음 | なし | 无
+dither-constant | Fixed 50% | 고정 50% | 固定 50% | 固定 50%
+dither-checker | Checkerboard | 체크무늬 | 市松模様 | 棋盘格
+dither-horizontal | Horizontal lines | 가로줄 | 横線 | 水平线
+dither-vertical | Vertical lines | 세로줄 | 縦線 | 垂直线
+dither-diagonal | Diagonal lines | 대각선 | 斜線 | 对角线
+dither-crosshatch | Crosshatch | 교차 빗금 | クロスハッチ | 交叉线
+dither-halftone | Halftone grid | 하프톤 격자 | ハーフトーン格子 | 半调网格
+dither-bayer2 | Bayer 2×2 | Bayer 2×2 | Bayer 2×2 | 拜耳 2×2
+dither-bayer4 | Bayer 4×4 | Bayer 4×4 | Bayer 4×4 | 拜耳 4×4
+dither-bayer8 | Bayer 8×8 | Bayer 8×8 | Bayer 8×8 | 拜耳 8×8
+dither-floyd-steinberg | Floyd-Steinberg | Floyd-Steinberg | Floyd-Steinberg | Floyd-Steinberg
+dither-atkinson | Atkinson | Atkinson | Atkinson | Atkinson
+quantize-overall | Overall | 전체 | 全体 | 全局
+quantize-segment | Per segment | 구간별 | 区間ごと | 分段
+quantize-levels | Color steps | 색상 단계 | 階調数 | 色阶数
+pattern-picker | Pattern | 패턴 | パターン | 图案
+pattern-solid | Solid color | 단색 | 単色 | 纯色
+pattern-dither-12 | 12.5% dither | 12.5% 디더 | 12.5% ディザ | 12.5% 抖动
+pattern-dither-25 | 25% dither | 25% 디더 | 25% ディザ | 25% 抖动
+pattern-checker-50 | 50% checker | 50% 체크 | 50% 市松 | 50% 棋盘
+pattern-dither-75 | 75% dither | 75% 디더 | 75% ディザ | 75% 抖动
+pattern-dither-87 | 87.5% dither | 87.5% 디더 | 87.5% ディザ | 87.5% 抖动
+pattern-h-stripe-1 | Thin horizontal stripes | 가는 가로줄 | 細い横縞 | 细横条纹
+pattern-h-stripe-2 | Thick horizontal stripes | 굵은 가로줄 | 太い横縞 | 粗横条纹
+pattern-v-stripe-1 | Thin vertical stripes | 가는 세로줄 | 細い縦縞 | 细竖条纹
+pattern-v-stripe-2 | Thick vertical stripes | 굵은 세로줄 | 太い縦縞 | 粗竖条纹
+pattern-diag-right | Diagonal right | 우상향 대각선 | 右上がり斜線 | 右斜线
+pattern-diag-left | Diagonal left | 좌상향 대각선 | 左上がり斜線 | 左斜线
+pattern-crosshatch-light | Light crosshatch | 옅은 교차 빗금 | 薄い網目 | 稀疏交叉线
+pattern-crosshatch-dense | Dense crosshatch | 촘촘한 교차 빗금 | 細かい網目 | 密集交叉线
+pattern-dots-4 | 4×4 dots | 4×4 점 | 4×4 ドット | 4×4 圆点
+pattern-bricks-4 | Bricks | 벽돌 | レンガ | 砖纹
+pattern-stipple-8 | 8×8 stipple | 8×8 점묘 | 8×8 砂目 | 8×8 点彩
+filter-gradient-map | Gradient map | 그라데이션 맵 | グラデーションマップ | 渐变映射
+filter-screentone | Screentone | 스크린톤 | スクリーントーン | 网点
+screentone-shape | Tone shape | 톤 모양 | トーン形状 | 网点形状
+screentone-dot | Dot | 점 | ドット | 圆点
+screentone-square | Square | 사각형 | 四角形 | 方点
+screentone-line | Line | 선 | ライン | 线条
+screentone-cross | Cross | 격자 | クロス | 十字格
+screentone-bayer | Bayer 4×4 | Bayer 4×4 | Bayer 4×4 | 拜耳 4×4
+screentone-size | Cell size | 셀 크기 | セルサイズ | 网格尺寸
+screentone-angle | Angle | 각도 | 角度 | 角度
+screentone-dot-color | Dot color | 톤 색 | トーンの色 | 网点颜色
+screentone-transparent-bg | Transparent background | 배경 투명 | 背景を透過 | 透明背景
+screentone-bg-color | Background color | 배경색 | 背景色 | 背景颜色

@@ -3094,6 +3094,7 @@ mod tests {
                 ..ugu_core::store::Brush::default()
             },
             seed: 1,
+            pattern: None,
         };
         let layer = document.layers[0].id;
         let changes = ugu_core::command::draw(&document, layer, airbrush, false, None);
@@ -3255,6 +3256,7 @@ mod tests {
                     ..Brush::default()
                 },
                 seed: 9,
+                pattern: None,
             },
         );
         if let LayerKind::Paint(paint) = &mut document.layers[0].kind {
