@@ -126,7 +126,7 @@ images/<sha256>.png  래스터 자산 (RGBA8, straight alpha, 정규화한 PNG)
 | 파일 | 머리 | 내용 |
 |---|---|---|
 | 복구 설명 `recovery\<창 폴더>\tab-<n>\<0·1>.json` (M5-6, 탭마다는 문서 탭) | `format: "ugurugu.recovery"`, `version: 1` | `sequence`, `name`, `path`, `time`, `canvas`, `layer`(M6에 더함, 활성 레이어). 문서는 같은 칸의 `<0·1>.ugurugu`이고 두 세대를 번갈아 쓴다. 창 폴더는 실행하는 동안 `lock` 파일로 잠근다. 탭 전의 3.0이 창 폴더에 바로 쓴 `<0·1>`도 읽는다. 폴더는 `%LOCALAPPDATA%\Ugurugu Data\3\recovery`(`recovery.rs`) |
-| 설정 `%APPDATA%\Ugurugu\3\settings.json` (M5-3) | `format: "ugurugu.settings"`, `version: 1` | `language`, `accent`, `theme`(`dark`·`light`·`system`, 기본인 `dark`이면 쓰지 않음), `wobbleAnimation`, `pixelGrid`, `defaultSaveFolder`, `exportSize`, `pixelExportScale`(픽셀 모드 내보내기의 정수 배, 1·2·4·8), `checkForUpdates`(끈 때만 씀), `tools`(도구 상태, 필압 켬·끔은 `tools.tablet.pressure`), `colorHistory`, `shortcuts`(기본과 다른 키만), `panels`(도크 배치), `window`(`left`·`top`·`right`·`bottom`·`maximized`, 닫을 때의 창, 작업 영역 픽셀). 기본값인 선택 키는 쓰지 않는다. 모르는 키는 지우지 않고 다시 쓴다. 여러 창은 `settings.json.lock`으로 차례를 지키고 바꾼 최상위 키만 덮어쓴다(decisions.md UI·단축키·번역). `settings.rs` |
+| 설정 `%APPDATA%\Ugurugu\3\settings.json` (M5-3) | `format: "ugurugu.settings"`, `version: 1` | `language`, `accent`, `theme`(`dark`·`light`·`system`, 기본인 `dark`이면 쓰지 않음), `wobbleAnimation`, `pixelGrid`, `defaultSaveFolder`, `exportSize`, `pixelExportScale`(픽셀 모드 내보내기의 정수 배, 1·2·4·8), `checkForUpdates`(끈 때만 씀), `tools`(도구 상태, `gradient`·선택적 `pattern` 포함, 필압 켬·끔은 `tools.tablet.pressure`), `gradients`(사용자 저장 그라데이션 프리셋 목록, 비면 쓰지 않음), `colorHistory`, `shortcuts`(기본과 다른 키만), `panels`(도크 배치), `window`(`left`·`top`·`right`·`bottom`·`maximized`, 닫을 때의 창, 작업 영역 픽셀). 기본값인 선택 키는 쓰지 않는다. 모르는 키는 지우지 않고 다시 쓴다. 여러 창은 `settings.json.lock`으로 차례를 지키고 바꾼 최상위 키만 덮어쓴다(decisions.md UI·단축키·번역). `settings.rs` |
 | 도구 프리셋 `*.ugurugu-tools` (M5-10) | `format: "ugurugu.tools"`, `version: 1` | `tools`(설정의 `tools`와 같은 글, `tablet` 제외)와 `motion`(`amount`, `style`, `poses`, `detail`, `linked`, `randomness`, `broken`, `breakAmount`, `breakRange`). 1MiB 상한, 모르는 키는 무시하고 있는 값만 덮어쓴다. 2.2.13 `.wwpreset`은 읽지 않는다. `settings/preset.rs` |
 
 ## 8. 키프레임·애니메이션 폴더와 기능 이름 (3.2.0, 3.3.0)
@@ -138,7 +138,7 @@ images/<sha256>.png  래스터 자산 (RGBA8, straight alpha, 정규화한 PNG)
 | `paint`·`group` | `keys` | `"keys"` | `pivot`(문서 px [x, y]), `keys`(프레임 순): `frame`(0 ≤ frame < 문서 프레임 수, 프레임마다 하나), `offset`(px, ±32767), `rotation`(도, 시계 방향, ±3600), `scale`(0.05~20), `flip`(켜졌을 때만 씀), `opacity`(0~1, 레이어 불투명도에 곱함, 1이면 쓰지 않음, 3.3.0), `ease`(`linear`·`smooth`·`hold`, 이 키에서 다음 키까지) |
 | `group` | `cels` | `"cels"` | 애니메이션 폴더의 노출표(프레임 순): `frame`, `cel`(그 그룹의 바로 아래 자식 id, `null`은 빈 프레임). 다음 노출 전까지 유지, 첫 노출 전 프레임은 마지막 노출 |
 
-3.3.0은 같은 방식으로 기능 이름 셋을 더했다(`ugu_io::write`의 `required`가 쓰는 문서를 보고 넣는다). 3.6.0이 `brush-fade`와 `layer-outline`을 더했다. 지금 `FEATURES`는 `keys`·`cels`·`frames`·`key-opacity`·`fill-behind`·`brush-fade`·`layer-outline` 일곱이다.
+3.3.0은 같은 방식으로 기능 이름 셋을 더했다(`ugu_io::write`의 `required`가 쓰는 문서를 보고 넣는다). 3.6.0이 `brush-fade`와 `layer-outline`을 더했고, 그라데이션·디더링·필터 레이어·패턴 기능이 `filter-layer`·`gradient-op`·`pattern`을 더했다. 지금 `FEATURES`는 `keys`·`cels`·`frames`·`key-opacity`·`fill-behind`·`brush-fade`·`layer-outline`·`filter-layer`·`gradient-op`·`pattern` 열이다.
 
 | `required` | 넣는 때 | 3.2 이하가 모르고 읽으면(`format.rs` 주석) |
 |---|---|---|
@@ -147,5 +147,8 @@ images/<sha256>.png  래스터 자산 (RGBA8, straight alpha, 정규화한 PNG)
 | `"fill-behind"` | `fill` 연산 하나라도 `behind: true`일 때(그룹·병합 section 안 포함) | 채우기를 선 뒤가 아니라 위에 덮어 그린다 |
 | `"brush-fade"` | 저장되는 획 하나라도 `brush.fade`가 0보다 클 때 | 획을 줄이지도 끊지도 않고 끝까지 그린다 |
 | `"layer-outline"` | 페인트 레이어 하나라도 `outline`이 있을 때(그룹 안 포함). 필드는 `{ width: 1~250, color: "#rrggbbaa" }` | 외곽선을 빼고 그린다 |
+| `"filter-layer"` | 문서에 `filter` 레이어가 하나 이상 있을 때. `layers[].filter`에 `{ opacity, blend, clip_to_below, kind }`(`gradient_map` 또는 `screentone`)를 둔다 | 필터 레이어를 빼고 그린다 |
+| `"gradient-op"` | 페인트 레이어 또는 section 안에 `op: "gradient"`가 하나 이상 있고 `gradients` 표에 정지점 정의를 저장할 때 | 그라데이션 연산을 빼고 그린다 |
+| `"pattern"` | `strokes[].pattern`이나 `ops[op="fill"].pattern`에 `1..=8` 크기의 1비트 마스크(`{ width, height, rows }`)가 하나 이상 있을 때 | 패턴 마스크 없이 단색으로 칠한다 |
 
 키가 있는 레이어의 화소는 그 프레임의 자세를 중심에 대해 크기·반전 → 회전 → 이동 순으로 적용한 위치에 그린다. 그룹의 키는 안의 레이어마다 자기 키 뒤에 곱한다(그룹 결과를 재샘플하지 않음). 검증 위반은 `DocumentError::Animation`이다.

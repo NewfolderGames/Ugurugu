@@ -2643,3 +2643,24 @@ Sandbox의 앱은 RTX 5080(Dx12)을 골랐다. 단계를 맞추느라 고치기 
 | 고지 | Windows 263 crate·77 license, 바꾸기 전 출력과 같은 바이트. macOS 270·74, Linux x64 352·106 |
 
 **결론:** ad-hoc 서명 번들도 Velopack 업데이트를 받는다. 남은 것은 GitHub에서 내려받아 quarantine이 붙은 번들(처음 열기의 "그래도 열기"와 그 뒤 업데이트), Linux AppImage의 업데이트, x64 AppImage를 실제 데스크톱에서 띄우는 것이다(B3-13). 업데이트는 smoke에 넣지 않았다: 적용은 사용자가 누르는 버튼에서 시작한다.
+
+## 130. 다중 정지점 그라데이션·디더링·필터 레이어·1비트 패턴의 성능과 정합성 확인 (2026-11-17)
+
+**질문:** 필터 레이어(그라데이션 맵의 Bayer·오차 확산 및 스크린톤)를 2048×2048 16레이어 문서에 추가할 때 프레임·합성·pen-up 지연과 최대 작업 메모리 증가는 얼마인가. 전체(`full`), 예산 0 스트림(`streamed`), 분할(`split`), 점진적 스탬프 경로가 같은 화소를 그리는가. UI 최소 창(1152×576)에서 그라데이션 도구와 패턴 선택기가 색상 휠 위치·레이어 버튼·접근성 규격을 유지하는가.
+
+**방법:** Linux `7.3.3-ogc1.1.fc45.x86_64`(AMD Ryzen 9 5900X 12-Core), Rust 1.99.0 release 빌드 `ugu-doc`(`UGU_WORKER_THREADS=8`). `ugu-doc fixture 2`로 2048×2048 16레이어 문서를 만들고, 최상단에 필터 레이어(`GradientMap` 3색 정지점 + `Overall(4)`의 `bayer4`·`floyd_steinberg`·`atkinson`, 그리고 `Screentone` `dot` 크기 8 · 각도 45°)를 각각 얹어 `ugu-doc render ... 8`을 실행해 60프레임과 14회 split 편집을 쟀다. 정합성과 UI 불변식은 `ugu-core`·`ugu-io`·`ugu-render`·`ugu-session`·`ugurugu` 단위·헤드리스 통합 시험으로 검증했다.
+
+**결과 (`ugu-doc render` 2048×2048 16레이어, `UGU_WORKER_THREADS=8`):**
+
+| 구성 | composite p50 (ms) | 프레임당 p50 / p95 (ms, 8스레드) | first split (ms) | pen-up p50 (ms) | 최대 메모리 (whole 후 / 끝, MiB) |
+|---|---|---|---|---|---|
+| 기준 (`fixture 2`, 필터 없음) | 14.4 | 76.2 / 79.4 | 117.7 | 1.4 | 495 / 934 |
+| `+ GradientMap (Bayer 4×4)` | 18.8 | 81.9 / 86.2 | 122.7 | 1.7 | 492 / 931 |
+| `+ Screentone (Dot, size=8, 45°)` | 18.2 | 79.3 / 81.5 | 117.2 | 1.7 | 499 / 938 |
+| `+ GradientMap (Floyd-Steinberg)` | 137.4 | 200.5 / 218.7 | 242.5 | 139.6 | 548 / 1161 |
+| `+ GradientMap (Atkinson)` | 134.8 | 198.0 / 202.9 | 245.0 | 135.7 | 548 / 1172 |
+
+- **경로 일치 시험:** `filter_layers_match_across_full_streamed_and_split`은 `Bayer4`·`FloydSteinberg`·`Atkinson`(루트·그룹·클리핑 조합)과 회전 스크린톤에서 `full`·`streamed(예산 0)`·`split`·재합성이 바이트 단위로 일치함을 확인했고, `gradient_op_and_patterned_strokes_and_fills_match_full_streamed_and_split`은 `Op::Gradient`와 패턴 획(`Line`·`Pixel`·`Spray`)·채우기(`behind=false/true`)의 전체/스트림/분할 바이트 일치와 점진 스탬프(`<= 1` LSB, 7절 문서화 오차)를 확인했다.
+- **UI와 접근성 시험:** `apps/ugurugu`의 `the_colour_wheel_stays_put_whatever_the_tool`이 새 `Tool::Gradient`를 포함한 10개 도구 전환에서 1600×900과 1152×576 모두 색상 휠 세로 위치 변화를 0.5pt 미만으로 통과했고, `small_windows_show_the_wheel_the_brush_size_and_the_layer_buttons`, `delete_never_covers_the_other_layer_buttons`, `gradient_editor_exposes_controls_and_reverses`, `pattern_picker_exposes_accesskit_button_and_presets`, `gradient_tool_previews_commits_cancels_and_refuses_filter_layer`, `pattern_applies_to_live_and_committed_pen_and_fill`이 모두 통과했다.
+
+**결론:** 위치 기반 디더(`Bayer 4×4`)와 스크린톤 필터 레이어는 8스레드 행 병렬 합성 덕분에 2048² 문서에서도 기준 대비 합성 +3.8~+4.4ms, pen-up +0.3ms로 동작한다. 오차 확산(`Floyd-Steinberg`·`Atkinson`)은 주사선 순차 의존성과 전체 캔버스 `run_whole_plane` 장벽 때문에 2048² 기준 합성 약 135~137ms가 들며, 전체·스트림·분할 결과는 바이트 단위로 같다.
