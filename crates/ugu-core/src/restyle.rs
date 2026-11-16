@@ -161,7 +161,7 @@ pub fn restyle(
 fn paint(document: &Document, layer: LayerId) -> Option<&crate::ops::PaintLayer> {
     match &document.layer(layer)?.kind {
         LayerKind::Paint(paint) => Some(paint),
-        LayerKind::Group(_) => None,
+        LayerKind::Group(_) | LayerKind::Filter(_) => None,
     }
 }
 
@@ -188,6 +188,7 @@ fn strokes_of(layer: &Layer, except: LayerId, out: &mut HashSet<StrokeId>) {
                 strokes_of(child, except, out);
             }
         }
+        LayerKind::Filter(_) => {}
     }
 }
 
@@ -590,6 +591,7 @@ mod tests {
             width,
             brush: Brush::DEFAULT,
             seed: 7,
+            pattern: None,
         }
     }
 
@@ -684,6 +686,7 @@ mod tests {
                 antialias: false,
                 clip: None,
                 behind: false,
+                pattern: None,
             },
         ];
         let (document, layer) = document(vec![line], vec![left.mask().clone()], ops);

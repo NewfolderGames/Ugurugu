@@ -285,18 +285,22 @@ impl Group {
     }
 }
 
+static EMPTY_KEYS: std::sync::LazyLock<Keys> = std::sync::LazyLock::new(Keys::default);
+
 impl Layer {
     pub fn keys(&self) -> &Keys {
         match &self.kind {
             LayerKind::Paint(paint) => &paint.keys,
             LayerKind::Group(group) => &group.keys,
+            LayerKind::Filter(_) => &EMPTY_KEYS,
         }
     }
 
-    pub fn keys_mut(&mut self) -> &mut Keys {
+    pub fn keys_mut(&mut self) -> Option<&mut Keys> {
         match &mut self.kind {
-            LayerKind::Paint(paint) => &mut paint.keys,
-            LayerKind::Group(group) => &mut group.keys,
+            LayerKind::Paint(paint) => Some(&mut paint.keys),
+            LayerKind::Group(group) => Some(&mut group.keys),
+            LayerKind::Filter(_) => None,
         }
     }
 
@@ -304,7 +308,7 @@ impl Layer {
     pub fn cels(&self) -> Option<&[Exposure]> {
         match &self.kind {
             LayerKind::Group(group) => group.cels.as_deref(),
-            LayerKind::Paint(_) => None,
+            LayerKind::Paint(_) | LayerKind::Filter(_) => None,
         }
     }
 }
@@ -399,7 +403,7 @@ pub(crate) fn trimmed(layer: &Layer, frames: u32) -> Option<Layer> {
 }
 
 fn trim(layer: &mut Layer, frames: u32) -> bool {
-    let mut changed = layer.keys_mut().trim(frames);
+    let mut changed = layer.keys_mut().is_some_and(|keys| keys.trim(frames));
     if let LayerKind::Group(group) = &mut layer.kind {
         if let Some(cels) = &mut group.cels {
             let before = cels.len();

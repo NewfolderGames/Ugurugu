@@ -125,6 +125,7 @@ mod tests {
             width: 4.0,
             brush: Brush::default(),
             seed: 0,
+            pattern: None,
         }
     }
 

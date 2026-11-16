@@ -8,7 +8,7 @@
 //! canvas each paint layer ends on.
 
 use crate::keys::{Exposure, Keys};
-use crate::ops::{Blend, Motion, Op, PaintLayer, Rgba8, Wobble};
+use crate::ops::{Blend, FilterKind, FilterLayer, Motion, Op, PaintLayer, Rgba8, Wobble};
 use crate::store::{Store, StoreError};
 
 /// Limits a document must stay within. The same as 2.2.13's, plus the depth
@@ -67,6 +67,7 @@ pub struct Layer {
 pub enum LayerKind {
     Paint(PaintLayer),
     Group(Group),
+    Filter(FilterLayer),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -87,6 +88,7 @@ impl Layer {
         match &self.kind {
             LayerKind::Paint(paint) => paint.clip_to_below,
             LayerKind::Group(group) => group.clip_to_below,
+            LayerKind::Filter(filter) => filter.clip_to_below,
         }
     }
 
@@ -94,6 +96,7 @@ impl Layer {
         match &self.kind {
             LayerKind::Paint(paint) => paint.opacity,
             LayerKind::Group(group) => group.opacity,
+            LayerKind::Filter(filter) => filter.opacity,
         }
     }
 
@@ -101,6 +104,7 @@ impl Layer {
         match &self.kind {
             LayerKind::Paint(paint) => paint.blend,
             LayerKind::Group(group) => group.blend,
+            LayerKind::Filter(filter) => filter.blend,
         }
     }
 }
@@ -125,6 +129,10 @@ pub enum DocumentError {
     Section(LayerId),
     /// An operation refers to a stroke, mask or image that is not stored.
     MissingData(LayerId),
+    /// A layer operation has invalid coordinates, pattern or quantization.
+    Operation(LayerId),
+    /// A filter layer has invalid stops, quantization or screentone parameters.
+    Filter(LayerId),
     /// Keys or exposures are out of order, past the last frame or outside
     /// the limits, or an exposure shows a layer outside its folder.
     Animation(LayerId),
@@ -152,6 +160,8 @@ impl std::fmt::Display for DocumentError {
             Self::TooManyOperations(count) => write!(f, "{count} operations is over the limit"),
             Self::Section(id) => write!(f, "layer {} has an invalid isolated section", id.0),
             Self::MissingData(id) => write!(f, "layer {} refers to data that is not stored", id.0),
+            Self::Operation(id) => write!(f, "layer {} has an invalid operation", id.0),
+            Self::Filter(id) => write!(f, "filter layer {} has invalid settings", id.0),
             Self::Animation(id) => write!(f, "layer {} has invalid keys or exposures", id.0),
             Self::OutlineWidth(id, width) => {
                 write!(f, "layer {} has outline width {width}", id.0)
@@ -294,6 +304,7 @@ impl Walk<'_> {
                     self.layers(&group.children, depth + 1)?;
                 }
                 LayerKind::Paint(paint) => self.paint(layer.id, paint)?,
+                LayerKind::Filter(filter) => self.filter(layer.id, filter)?,
             }
         }
         Ok(())
@@ -334,6 +345,20 @@ impl Walk<'_> {
         self.ops(id, &paint.ops, 0)
     }
 
+    fn filter(&self, id: LayerId, filter: &FilterLayer) -> Result<(), DocumentError> {
+        check_opacity(id, filter.opacity)?;
+        let valid = match &filter.kind {
+            FilterKind::GradientMap {
+                gradient, quantize, ..
+            } => gradient.is_valid() && quantize.is_valid(),
+            FilterKind::Screentone(tone) => tone.is_valid(),
+        };
+        if !valid {
+            return Err(DocumentError::Filter(id));
+        }
+        Ok(())
+    }
+
     fn ops(&mut self, id: LayerId, ops: &[Op], section_depth: usize) -> Result<(), DocumentError> {
         self.operations += ops.len();
         if self.operations > limits::OPERATIONS {
@@ -345,8 +370,35 @@ impl Walk<'_> {
                     self.store.strokes.contains_key(stroke)
                         && clip.is_none_or(|mask| self.store.masks.contains_key(&mask))
                 }
-                Op::Fill { coverage, clip, .. } => {
+                Op::Fill {
+                    coverage,
+                    clip,
+                    pattern,
+                    ..
+                } => {
+                    if pattern.is_some_and(|p| !p.is_valid()) {
+                        return Err(DocumentError::Operation(id));
+                    }
                     self.store.masks.contains_key(coverage)
+                        && clip.is_none_or(|mask| self.store.masks.contains_key(&mask))
+                }
+                Op::Gradient {
+                    gradient,
+                    from,
+                    to,
+                    quantize,
+                    opacity,
+                    clip,
+                    ..
+                } => {
+                    let limit = crate::store::limits::COORDINATE;
+                    let coords_ok = [from[0], from[1], to[0], to[1]]
+                        .iter()
+                        .all(|v| v.is_finite() && v.abs() <= limit);
+                    if !coords_ok || !quantize.is_valid() || !(0.0..=1.0).contains(opacity) {
+                        return Err(DocumentError::Operation(id));
+                    }
+                    self.store.gradients.contains_key(gradient)
                         && clip.is_none_or(|mask| self.store.masks.contains_key(&mask))
                 }
                 Op::PlaceImage { asset, .. } => self.store.assets.contains_key(asset),
@@ -565,6 +617,7 @@ mod tests {
                     ..Brush::default()
                 },
                 seed: 1,
+                pattern: None,
             },
         );
         store

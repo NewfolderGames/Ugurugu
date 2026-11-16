@@ -8,12 +8,15 @@
 pub mod brush;
 pub mod clip;
 pub mod command;
+pub mod dither;
 pub mod document;
 pub mod edit;
+pub mod gradient;
 pub mod history;
 pub mod keys;
 pub mod motion;
 pub mod ops;
+pub mod pattern;
 pub mod restyle;
 pub mod selection;
 pub mod store;

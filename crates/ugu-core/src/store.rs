@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ops::{AssetId, MaskId, Rgba8, StrokeId};
+use crate::gradient::Gradient;
+use crate::ops::{AssetId, GradientId, MaskId, Rgba8, StrokeId};
+use crate::pattern::Pattern;
 
 pub mod limits {
     pub const POINTS_PER_STROKE: usize = 200_000;
@@ -139,6 +141,8 @@ pub struct Stroke {
     pub brush: Brush,
     /// Fixes the stroke's motion; never changes once drawn.
     pub seed: u64,
+    /// Repeating 1-bit pixel pattern aligned to document `(0, 0)`.
+    pub pattern: Option<Pattern>,
 }
 
 /// One bit per pixel inside `bounds`, rows padded to whole bytes, the
@@ -273,6 +277,7 @@ pub struct Store {
     pub strokes: HashMap<StrokeId, Stroke>,
     pub masks: HashMap<MaskId, Mask>,
     pub assets: HashMap<AssetId, Asset>,
+    pub gradients: HashMap<GradientId, Gradient>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -281,10 +286,12 @@ pub enum StoreError {
     StrokePoint(StrokeId),
     StrokeWidth(StrokeId),
     StrokeBrush(StrokeId),
+    StrokePattern(StrokeId),
     TooManyPoints(usize),
     MaskSize(MaskId),
     MaskBounds(MaskId),
     AssetSize(AssetId),
+    Gradient(GradientId),
     TooManyBytes(u64),
     TooManyPixels(u64),
 }
@@ -296,10 +303,12 @@ impl std::fmt::Display for StoreError {
             Self::StrokePoint(id) => write!(f, "stroke {} has a point out of range", id.0),
             Self::StrokeWidth(id) => write!(f, "stroke {} has an invalid width", id.0),
             Self::StrokeBrush(id) => write!(f, "stroke {} has a brush setting out of range", id.0),
+            Self::StrokePattern(id) => write!(f, "stroke {} has an invalid pattern", id.0),
             Self::TooManyPoints(count) => write!(f, "{count} points is over the limit"),
             Self::MaskSize(id) => write!(f, "mask {} does not match its bounds", id.0),
             Self::MaskBounds(id) => write!(f, "mask {} lies outside the largest canvas", id.0),
             Self::AssetSize(_) => write!(f, "an image is empty or over the size limit"),
+            Self::Gradient(id) => write!(f, "gradient {} has invalid stops", id.0),
             Self::TooManyBytes(bytes) => write!(f, "{bytes} bytes of data is over the limit"),
             Self::TooManyPixels(pixels) => write!(f, "{pixels} image pixels is over the limit"),
         }
@@ -309,7 +318,7 @@ impl std::fmt::Display for StoreError {
 impl std::error::Error for StoreError {}
 
 impl Store {
-    /// Bytes held, as stored: 12 per point, mask bits, PNG bytes.
+    /// Bytes held, as stored: 12 per point, mask bits, PNG bytes, gradient stops.
     pub fn bytes(&self) -> u64 {
         let points: usize = self
             .strokes
@@ -318,7 +327,8 @@ impl Store {
             .sum();
         let masks: usize = self.masks.values().map(|mask| mask.bits.len()).sum();
         let assets: usize = self.assets.values().map(|asset| asset.png.len()).sum();
-        (points * 12 + masks + assets) as u64
+        let gradients: usize = self.gradients.values().map(|g| g.stops.len() * 8).sum();
+        (points * 12 + masks + assets + gradients) as u64
     }
 
     /// Checks every item and the totals; for a document just read.
@@ -331,6 +341,9 @@ impl Store {
         }
         for (&id, asset) in &self.assets {
             check_asset(id, asset)?;
+        }
+        for (&id, gradient) in &self.gradients {
+            check_gradient(id, gradient)?;
         }
         self.check_totals()
     }
@@ -382,7 +395,18 @@ pub fn check_stroke(id: StrokeId, stroke: &Stroke) -> Result<(), StoreError> {
     if !brush_in_range(&stroke.brush) {
         return Err(StoreError::StrokeBrush(id));
     }
+    if stroke.pattern.is_some_and(|pattern| !pattern.is_valid()) {
+        return Err(StoreError::StrokePattern(id));
+    }
     Ok(())
+}
+
+pub fn check_gradient(id: GradientId, gradient: &Gradient) -> Result<(), StoreError> {
+    if gradient.is_valid() {
+        Ok(())
+    } else {
+        Err(StoreError::Gradient(id))
+    }
 }
 
 /// 2.2.13's `isValidBrushSettings`.
@@ -491,6 +515,7 @@ mod tests {
             width: 6.0,
             brush: Brush::default(),
             seed: 7,
+            pattern: None,
         }
     }
 

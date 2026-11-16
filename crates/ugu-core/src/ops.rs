@@ -5,6 +5,10 @@
 //! its operations in order to a transparent surface, so each operation acts on
 //! the result of the ones before it and never on later ones.
 
+use crate::dither::{Dither, Screentone};
+use crate::gradient::{Gradient, GradientShape, QuantizeMode};
+use crate::pattern::Pattern;
+
 /// A stroke's points, brush and seed, stored once and referenced by id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StrokeId(pub u32);
@@ -12,6 +16,10 @@ pub struct StrokeId(pub u32);
 /// A binary mask with bounds, stored once and referenced by id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MaskId(pub u32);
+
+/// A multi-stop gradient, stored once and referenced by id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GradientId(pub u32);
 
 /// A raster asset, named by the SHA-256 of its normalized PNG.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -210,6 +218,20 @@ pub enum Op {
         /// Laid behind what the layer holds instead of replacing it: a
         /// bucket that stops at lines, whose coverage reaches under them.
         behind: bool,
+        /// Repeating 1-bit pixel pattern aligned to document `(0, 0)`.
+        pattern: Option<Pattern>,
+    },
+    /// Draws a dithered or smooth multi-stop gradient across the layer (or
+    /// `clip`), fixed in document space like a fill.
+    Gradient {
+        gradient: GradientId,
+        shape: GradientShape,
+        from: [f32; 2],
+        to: [f32; 2],
+        dither: Dither,
+        quantize: QuantizeMode,
+        opacity: f32,
+        clip: Option<MaskId>,
     },
     PlaceImage {
         asset: AssetId,
@@ -274,6 +296,47 @@ pub struct PaintLayer {
     /// The canvas size before the first operation.
     pub initial_size: [u32; 2],
     pub keys: crate::keys::Keys,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FilterKind {
+    GradientMap {
+        gradient: Gradient,
+        dither: Dither,
+        quantize: QuantizeMode,
+    },
+    Screentone(Screentone),
+}
+
+impl Default for FilterKind {
+    fn default() -> Self {
+        Self::GradientMap {
+            gradient: Gradient::default(),
+            dither: Dither::Bayer4,
+            quantize: QuantizeMode::default(),
+        }
+    }
+}
+
+/// Non-destructive adjustment layer transforming all layers below it in the
+/// same scope (document root or enclosing group).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilterLayer {
+    pub opacity: f32,
+    pub blend: Blend,
+    pub clip_to_below: bool,
+    pub kind: FilterKind,
+}
+
+impl Default for FilterLayer {
+    fn default() -> Self {
+        Self {
+            opacity: 1.0,
+            blend: Blend::Normal,
+            clip_to_below: false,
+            kind: FilterKind::default(),
+        }
+    }
 }
 
 impl PaintLayer {

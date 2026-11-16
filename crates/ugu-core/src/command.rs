@@ -6,10 +6,15 @@
 //! Builders only read the document; nothing changes until the list is
 //! committed, which checks it and applies all of it or none.
 
+use crate::dither::Dither;
 use crate::document::{Document, Group, Layer, LayerId, LayerKind};
 use crate::edit::{Change, EditError, Settings};
+use crate::gradient::{Gradient, GradientShape, QuantizeMode};
 use crate::keys::{self, Exposure, Keys};
-use crate::ops::{self, Blend, MaskId, Op, PaintLayer, Rgba8, Sampling, StrokeId};
+use crate::ops::{
+    self, Blend, FilterLayer, GradientId, MaskId, Op, PaintLayer, Rgba8, Sampling, StrokeId,
+};
+use crate::pattern::Pattern;
 use crate::store::{FreeIds, Store, Stroke};
 
 /// Stroke ids not in use. Ids freed by undo may be reused, because a new
@@ -22,8 +27,16 @@ pub fn free_mask_ids(store: &Store) -> FreeIds<impl Iterator<Item = u32> + Clone
     FreeIds::new(store.masks.keys().map(|id| id.0))
 }
 
+pub fn free_gradient_ids(store: &Store) -> FreeIds<impl Iterator<Item = u32> + Clone + '_> {
+    FreeIds::new(store.gradients.keys().map(|id| id.0))
+}
+
 pub fn next_stroke_id(document: &Document) -> StrokeId {
     StrokeId(free_stroke_ids(&document.store).take())
+}
+
+pub fn next_gradient_id(document: &Document) -> GradientId {
+    GradientId(free_gradient_ids(&document.store).take())
 }
 
 pub fn next_layer_id(document: &Document) -> LayerId {
@@ -63,7 +76,8 @@ pub fn draw(
 }
 
 /// Fills `coverage`, a stored mask, with `color` on top of `layer`'s
-/// operations, behind what is there when `behind`.
+/// operations, behind what is there when `behind`, masked by `pattern` if any.
+#[allow(clippy::too_many_arguments)]
 pub fn fill(
     document: &Document,
     layer: LayerId,
@@ -72,6 +86,7 @@ pub fn fill(
     antialias: bool,
     clip: Option<MaskId>,
     behind: bool,
+    pattern: Option<Pattern>,
 ) -> Vec<Change> {
     let index = top_of(document, layer);
     let op = Op::Fill {
@@ -80,8 +95,42 @@ pub fn fill(
         antialias,
         clip,
         behind,
+        pattern,
     };
     vec![Change::InsertOp { layer, index, op }]
+}
+
+/// Draws a smooth or dithered multi-stop gradient on top of `layer`'s
+/// operations, inside `clip` when given.
+#[allow(clippy::too_many_arguments)]
+pub fn gradient(
+    document: &Document,
+    layer: LayerId,
+    gradient: Gradient,
+    shape: GradientShape,
+    from: [f32; 2],
+    to: [f32; 2],
+    dither: Dither,
+    quantize: QuantizeMode,
+    opacity: f32,
+    clip: Option<MaskId>,
+) -> Vec<Change> {
+    let id = next_gradient_id(document);
+    let index = top_of(document, layer);
+    let op = Op::Gradient {
+        gradient: id,
+        shape,
+        from,
+        to,
+        dither,
+        quantize,
+        opacity,
+        clip,
+    };
+    vec![
+        Change::InsertGradient(id, gradient),
+        Change::InsertOp { layer, index, op },
+    ]
 }
 
 /// Moves `mask`'s part of `layer` by `transform`, leaving the source in
@@ -159,6 +208,32 @@ pub fn add_paint_layer(
     )
 }
 
+/// A new filter layer at `index` in `parent` (`None` for the top level).
+pub fn add_filter_layer(
+    document: &Document,
+    parent: Option<LayerId>,
+    index: usize,
+    name: String,
+    filter: FilterLayer,
+) -> (LayerId, Vec<Change>) {
+    let id = next_layer_id(document);
+    let layer = Layer {
+        id,
+        name,
+        visible: true,
+        reference: false,
+        kind: LayerKind::Filter(filter),
+    };
+    (
+        id,
+        vec![Change::InsertLayer {
+            parent,
+            index,
+            layer,
+        }],
+    )
+}
+
 /// Removes `id`, and its exposures when it is a cel.
 pub fn remove_layer(document: &Document, id: LayerId) -> Vec<Change> {
     let mut changes: Vec<Change> = unexpose(document, id, None).into_iter().collect();
@@ -201,7 +276,7 @@ pub fn duplicate_layer(
 ) -> Result<(LayerId, Vec<Change>), EditError> {
     let (parent, index) = document.position(id).ok_or(EditError::NoSuchLayer(id))?;
     let source = document.layer(id).ok_or(EditError::NoSuchLayer(id))?;
-    if !matches!(source.kind, LayerKind::Paint(_)) {
+    if !matches!(source.kind, LayerKind::Paint(_) | LayerKind::Filter(_)) {
         return Err(EditError::NotPaintLayer(id));
     }
     let copy = next_layer_id(document);
@@ -263,6 +338,7 @@ pub fn wrap_in_group(
     let clip_to_below = std::mem::take(match &mut inside.kind {
         LayerKind::Paint(paint) => &mut paint.clip_to_below,
         LayerKind::Group(group) => &mut group.clip_to_below,
+        LayerKind::Filter(filter) => &mut filter.clip_to_below,
     });
     let group = Layer {
         id,
@@ -393,6 +469,7 @@ pub fn ungroup(document: &Document, group: LayerId) -> Result<Vec<Change>, EditE
             match &mut layer.kind {
                 LayerKind::Paint(paint) => paint.clip_to_below = true,
                 LayerKind::Group(group) => group.clip_to_below = true,
+                LayerKind::Filter(filter) => filter.clip_to_below = true,
             }
         }
         Change::InsertLayer {
@@ -418,7 +495,9 @@ pub fn move_to_group(
             Some(LayerKind::Group(content)) => content.children.len().saturating_sub(usize::from(
                 content.children.iter().any(|child| child.id == id),
             )),
-            Some(LayerKind::Paint(_)) => return Err(EditError::NotGroup(group)),
+            Some(LayerKind::Paint(_) | LayerKind::Filter(_)) => {
+                return Err(EditError::NotGroup(group));
+            }
             None => return Err(EditError::NoSuchLayer(group)),
         },
         None => {
@@ -445,7 +524,7 @@ fn contains(layer: &Layer, id: LayerId) -> bool {
             .children
             .iter()
             .any(|child| child.id == id || contains(child, id)),
-        LayerKind::Paint(_) => false,
+        LayerKind::Paint(_) | LayerKind::Filter(_) => false,
     }
 }
 
@@ -455,7 +534,7 @@ pub fn siblings(document: &Document, parent: Option<LayerId>) -> Option<&[Layer]
         None => Some(&document.layers),
         Some(id) => match &document.layer(id)?.kind {
             LayerKind::Group(group) => Some(&group.children),
-            LayerKind::Paint(_) => None,
+            LayerKind::Paint(_) | LayerKind::Filter(_) => None,
         },
     }
 }
@@ -575,10 +654,11 @@ fn rekeyed(
     each_layer(&document.layers, &mut |layer| {
         if !layer.keys().is_empty() {
             let mut copy = layer.clone();
-            let keys = copy.keys_mut();
-            keys.pivot = point(keys.pivot);
-            for key in &mut keys.keys {
-                key.pose.offset = offset(key.pose.offset);
+            if let Some(keys) = copy.keys_mut() {
+                keys.pivot = point(keys.pivot);
+                for key in &mut keys.keys {
+                    key.pose.offset = offset(key.pose.offset);
+                }
             }
             changes.push(Change::ReplaceLayer(copy));
         }
@@ -597,6 +677,7 @@ fn canvas_change(document: &Document, size: [u32; 2], op: Op) -> Vec<Change> {
                     op: op.clone(),
                 }),
                 LayerKind::Group(group) => each_paint(&group.children, changes, op),
+                LayerKind::Filter(_) => {}
             }
         }
     }
@@ -635,6 +716,7 @@ mod tests {
                 ..Brush::default()
             },
             seed: 1,
+            pattern: None,
         }
     }
 
@@ -1171,8 +1253,9 @@ mod tests {
         let mut keyed = three_layers();
         run(&mut keyed, |document| {
             update_layer(document, LayerId(2), |layer| {
-                layer.keys_mut().set(key(0, 3.0));
-                layer.keys_mut().set(key(4, 3.0));
+                let keys = layer.keys_mut().unwrap();
+                keys.set(key(0, 3.0));
+                keys.set(key(4, 3.0));
             })
             .unwrap()
         })
@@ -1197,7 +1280,7 @@ mod tests {
         assert_eq!(placed.validate(), Ok(()));
         run(&mut keyed, |document| {
             update_layer(document, LayerId(2), |layer| {
-                layer.keys_mut().set(key(4, 9.0))
+                layer.keys_mut().unwrap().set(key(4, 9.0))
             })
             .unwrap()
         })
@@ -1215,7 +1298,7 @@ mod tests {
         let mut document = three_layers();
         run(&mut document, |document| {
             update_layer(document, LayerId(2), |layer| {
-                layer.keys_mut().set(key(0, 0.5));
+                layer.keys_mut().unwrap().set(key(0, 0.5));
             })
             .unwrap()
         })
@@ -1230,7 +1313,7 @@ mod tests {
         assert!(merge_down(&document, LayerId(2)).is_ok());
         run(&mut document, |document| {
             update_layer(document, group, |layer| {
-                layer.keys_mut().set(key(0, 0.5));
+                layer.keys_mut().unwrap().set(key(0, 0.5));
             })
             .unwrap()
         })
@@ -1246,8 +1329,9 @@ mod tests {
         let (mut document, folder) = with_folder();
         run(&mut document, |document| {
             update_layer(document, LayerId(1), |layer| {
-                layer.keys_mut().set(key(0, 1.0));
-                layer.keys_mut().set(key(20, 2.0));
+                let keys = layer.keys_mut().unwrap();
+                keys.set(key(0, 1.0));
+                keys.set(key(20, 2.0));
             })
             .unwrap()
         })
@@ -1266,7 +1350,7 @@ mod tests {
     #[test]
     fn keys_past_the_last_frame_or_showing_another_layer_are_invalid() {
         let mut document = three_layers();
-        document.layers[0].keys_mut().set(key(30, 1.0));
+        document.layers[0].keys_mut().unwrap().set(key(30, 1.0));
         assert_eq!(
             document.validate(),
             Err(crate::document::DocumentError::Animation(LayerId(1)))
@@ -1285,7 +1369,7 @@ mod tests {
         let mut wild = three_layers();
         let mut far = key(0, 40_000.0);
         far.pose.scale = 1.0;
-        wild.layers[0].keys_mut().set(far);
+        wild.layers[0].keys_mut().unwrap().set(far);
         assert!(wild.validate().is_err());
     }
 
@@ -1294,8 +1378,9 @@ mod tests {
         let mut document = three_layers();
         run(&mut document, |document| {
             update_layer(document, LayerId(1), |layer| {
-                layer.keys_mut().pivot = [10.0, 20.0];
-                layer.keys_mut().set(key(0, 4.0));
+                let keys = layer.keys_mut().unwrap();
+                keys.pivot = [10.0, 20.0];
+                keys.set(key(0, 4.0));
             })
             .unwrap()
         })

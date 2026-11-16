@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::document::{Document, Layer, LayerId, LayerKind};
 use crate::edit::Change;
-use crate::ops::{Affine, AssetId, MaskId, Op, PaintLayer, Sampling, StrokeId};
+use crate::ops::{Affine, AssetId, GradientId, MaskId, Op, PaintLayer, Sampling, StrokeId};
 use crate::selection::Selection;
 use crate::store::{Asset, Store};
 
@@ -52,6 +52,11 @@ pub fn copy(document: &Document, layer: LayerId, selection: Arc<Selection>) -> O
             Reference::Asset(id) => {
                 if let Some(asset) = document.store.assets.get(&id) {
                     store.assets.insert(id, asset.clone());
+                }
+            }
+            Reference::Gradient(id) => {
+                if let Some(gradient) = document.store.gradients.get(&id) {
+                    store.gradients.insert(id, gradient.clone());
                 }
             }
         });
@@ -123,11 +128,25 @@ pub fn paste(
             changes.push(Change::InsertAsset(id, asset.clone()));
         }
     }
+    let mut free_gradients = crate::command::free_gradient_ids(store);
+    let mut gradients = HashMap::new();
+    let mut sorted: Vec<_> = clip.store.gradients.iter().collect();
+    sorted.sort_by_key(|(id, _)| **id);
+    for (&id, gradient) in sorted {
+        let to = if store.gradients.get(&id) == Some(gradient) {
+            id
+        } else {
+            let new = GradientId(free_gradients.take());
+            changes.push(Change::InsertGradient(new, gradient.clone()));
+            new
+        };
+        gradients.insert(id, to);
+    }
     let mut ops: Vec<Op> = clip
         .layer
         .ops
         .iter()
-        .map(|op| renamed(op, &strokes, &masks))
+        .map(|op| renamed(op, &strokes, &masks, &gradients))
         .collect();
     let selection = if clip.canvas == document.canvas {
         Some(clip.selection.as_ref().clone())
@@ -216,6 +235,7 @@ enum Reference {
     Stroke(StrokeId),
     Mask(MaskId),
     Asset(AssetId),
+    Gradient(GradientId),
 }
 
 fn each_reference(op: &Op, each: &mut impl FnMut(Reference)) {
@@ -228,6 +248,12 @@ fn each_reference(op: &Op, each: &mut impl FnMut(Reference)) {
         }
         Op::Fill { coverage, clip, .. } => {
             each(Reference::Mask(*coverage));
+            if let Some(clip) = clip {
+                each(Reference::Mask(*clip));
+            }
+        }
+        Op::Gradient { gradient, clip, .. } => {
+            each(Reference::Gradient(*gradient));
             if let Some(clip) = clip {
                 each(Reference::Mask(*clip));
             }
@@ -245,10 +271,16 @@ fn each_reference(op: &Op, each: &mut impl FnMut(Reference)) {
     }
 }
 
-/// `op` with its stroke and mask ids replaced as the maps say.
-fn renamed(op: &Op, strokes: &HashMap<StrokeId, StrokeId>, masks: &HashMap<MaskId, MaskId>) -> Op {
+/// `op` with its stroke, mask and gradient ids replaced as the maps say.
+fn renamed(
+    op: &Op,
+    strokes: &HashMap<StrokeId, StrokeId>,
+    masks: &HashMap<MaskId, MaskId>,
+    gradients: &HashMap<GradientId, GradientId>,
+) -> Op {
     let stroke = |id: &StrokeId| strokes.get(id).copied().unwrap_or(*id);
     let mask = |id: &MaskId| masks.get(id).copied().unwrap_or(*id);
+    let gradient = |id: &GradientId| gradients.get(id).copied().unwrap_or(*id);
     match op {
         Op::Paint { stroke: id, clip } => Op::Paint {
             stroke: stroke(id),
@@ -264,12 +296,33 @@ fn renamed(op: &Op, strokes: &HashMap<StrokeId, StrokeId>, masks: &HashMap<MaskI
             antialias,
             clip,
             behind,
+            pattern,
         } => Op::Fill {
             coverage: mask(coverage),
             color: *color,
             antialias: *antialias,
             clip: clip.as_ref().map(mask),
             behind: *behind,
+            pattern: *pattern,
+        },
+        Op::Gradient {
+            gradient: id,
+            shape,
+            from,
+            to,
+            dither,
+            quantize,
+            opacity,
+            clip,
+        } => Op::Gradient {
+            gradient: gradient(id),
+            shape: *shape,
+            from: *from,
+            to: *to,
+            dither: *dither,
+            quantize: *quantize,
+            opacity: *opacity,
+            clip: clip.as_ref().map(mask),
         },
         Op::TransformSelection {
             mask: id,
@@ -288,7 +341,7 @@ fn renamed(op: &Op, strokes: &HashMap<StrokeId, StrokeId>, masks: &HashMap<MaskI
             section.ops = section
                 .ops
                 .iter()
-                .map(|op| renamed(op, strokes, masks))
+                .map(|op| renamed(op, strokes, masks, gradients))
                 .collect();
             Op::Isolated(Box::new(section))
         }
@@ -320,6 +373,7 @@ mod tests {
             width: 4.0,
             brush: Brush::default(),
             seed: 1,
+            pattern: None,
         }
     }
 

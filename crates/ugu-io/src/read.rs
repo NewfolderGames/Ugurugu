@@ -13,12 +13,15 @@ use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
+use ugu_core::dither::{Dither, Screentone, ToneShape};
 use ugu_core::document::{Document, DocumentError, Group, Layer, LayerId, LayerKind};
+use ugu_core::gradient::{Gradient, GradientShape, GradientStop, QuantizeMode};
 use ugu_core::keys::{Ease, Exposure, Key, Keys, Pose};
 use ugu_core::ops::{
-    Affine, AssetId, Blend, MaskId, Motion, MotionStyle, Op, Outline, PaintLayer, Rgba8, Sampling,
-    Section, StrokeId, Wobble,
+    Affine, AssetId, Blend, FilterKind, FilterLayer, GradientId, MaskId, Motion, MotionStyle, Op,
+    Outline, PaintLayer, Rgba8, Sampling, Section, StrokeId, Wobble,
 };
+use ugu_core::pattern::Pattern;
 use ugu_core::store::{self, Asset, Brush, BrushEngine, Mask, Point, Store, Stroke, TipShape};
 use zip::ZipArchive;
 
@@ -43,6 +46,7 @@ pub mod limits {
     /// A paint, erase or fill refers to two masks at most.
     pub const MASKS: usize = 2 * ugu_core::document::limits::OPERATIONS;
     pub const IMAGES: usize = ugu_core::document::limits::OPERATIONS;
+    pub const GRADIENTS: usize = ugu_core::document::limits::OPERATIONS;
 }
 
 #[derive(Debug)]
@@ -220,7 +224,7 @@ pub fn read_with<R: Read + Seek>(
     let active = dto.active_layer.map(LayerId).filter(|id| {
         matches!(
             document.layer(*id).map(|layer| &layer.kind),
-            Some(LayerKind::Paint(_))
+            Some(LayerKind::Paint(_) | LayerKind::Filter(_))
         )
     });
     Ok((document, id, active))
@@ -358,6 +362,7 @@ impl<R: Read + Seek> Entries<R> {
             (dto.strokes.len(), limits::STROKES, "strokes"),
             (dto.masks.len(), limits::MASKS, "masks"),
             (dto.images.len(), limits::IMAGES, "images"),
+            (dto.gradients.len(), limits::GRADIENTS, "gradients"),
         ] {
             if count > limit {
                 return Err(ReadError::TooLarge(format!("{count} {what}")));
@@ -416,6 +421,7 @@ impl<R: Read + Seek> Entries<R> {
                     fade: stroke.brush.fade,
                 },
                 seed: u64::from_be_bytes(seed),
+                pattern: stroke.pattern.as_ref().map(pattern).transpose()?,
             };
             if store.strokes.insert(id, value).is_some() {
                 return Err(corrupt(format!("stroke {} appears twice", stroke.id)));
@@ -452,6 +458,16 @@ impl<R: Read + Seek> Entries<R> {
             };
             if store.assets.insert(AssetId(id), value).is_some() {
                 return Err(corrupt(format!("image {} appears twice", image.id)));
+            }
+        }
+        for entry in &dto.gradients {
+            let value = Gradient::new(gradient_stops(&entry.stops)?);
+            if store
+                .gradients
+                .insert(GradientId(entry.id), value)
+                .is_some()
+            {
+                return Err(corrupt(format!("gradient {} appears twice", entry.id)));
             }
         }
         Ok(store)
@@ -625,8 +641,8 @@ fn outline(dto: &OutlineDto) -> Result<Outline, ReadError> {
 }
 
 fn layer(dto: &LayerDto) -> Result<Layer, ReadError> {
-    let kind = match (&dto.paint, &dto.group) {
-        (Some(paint), None) => LayerKind::Paint(PaintLayer {
+    let kind = match (&dto.paint, &dto.group, &dto.filter) {
+        (Some(paint), None, None) => LayerKind::Paint(PaintLayer {
             ops: paint.ops.iter().map(op).collect::<Result<_, _>>()?,
             outline: paint.outline.as_ref().map(outline).transpose()?,
             opacity: paint.opacity,
@@ -636,7 +652,7 @@ fn layer(dto: &LayerDto) -> Result<Layer, ReadError> {
             initial_size: paint.initial_size,
             keys: keys(paint.keys.as_ref()),
         }),
-        (None, Some(group)) => LayerKind::Group(Group {
+        (None, Some(group), None) => LayerKind::Group(Group {
             opacity: group.opacity,
             blend: blend(group.blend),
             clip_to_below: group.clip_to_below,
@@ -651,9 +667,53 @@ fn layer(dto: &LayerDto) -> Result<Layer, ReadError> {
                     .collect()
             }),
         }),
+        (None, None, Some(filter)) => LayerKind::Filter(FilterLayer {
+            opacity: filter.opacity,
+            blend: blend(filter.blend),
+            clip_to_below: filter.clip_to_below,
+            kind: match &filter.kind {
+                FilterKindDto::GradientMap {
+                    stops,
+                    dither: d,
+                    quantize: q,
+                } => FilterKind::GradientMap {
+                    gradient: Gradient::new(gradient_stops(stops)?),
+                    dither: dither(*d),
+                    quantize: quantize(*q),
+                },
+                FilterKindDto::Screentone {
+                    shape,
+                    size,
+                    angle,
+                    dot_color,
+                    background,
+                } => {
+                    if !size.is_finite() || !angle.is_finite() {
+                        return Err(corrupt("screentone parameter is not finite"));
+                    }
+                    FilterKind::Screentone(Screentone {
+                        shape: tone_shape(*shape),
+                        size: *size,
+                        angle: *angle,
+                        dot_color: Rgba8(
+                            parse_color(dot_color)
+                                .ok_or_else(|| corrupt("screentone dot colour"))?,
+                        ),
+                        background: background
+                            .as_ref()
+                            .map(|bg| {
+                                parse_color(bg)
+                                    .map(Rgba8)
+                                    .ok_or_else(|| corrupt("screentone background colour"))
+                            })
+                            .transpose()?,
+                    })
+                }
+            },
+        }),
         _ => {
             return Err(corrupt(format!(
-                "layer {} must be either paint or group",
+                "layer {} must be paint, group, or filter",
                 dto.id
             )));
         }
@@ -665,6 +725,80 @@ fn layer(dto: &LayerDto) -> Result<Layer, ReadError> {
         reference: dto.reference,
         kind,
     })
+}
+
+fn gradient_stops(list: &[GradientStopDto]) -> Result<Vec<GradientStop>, ReadError> {
+    list.iter()
+        .map(|stop| {
+            if !stop.position.is_finite() {
+                return Err(corrupt("gradient stop position is not finite"));
+            }
+            Ok(GradientStop {
+                position: stop.position,
+                color: Rgba8(
+                    parse_color(&stop.color).ok_or_else(|| corrupt("gradient stop colour"))?,
+                ),
+            })
+        })
+        .collect()
+}
+
+fn pattern(dto: &PatternDto) -> Result<Pattern, ReadError> {
+    if !(1..=8).contains(&dto.width)
+        || !(1..=8).contains(&dto.height)
+        || dto.rows.len() != usize::from(dto.height)
+    {
+        return Err(corrupt("pattern dimensions do not match its rows"));
+    }
+    let mut rows = [0u8; 8];
+    rows[..dto.rows.len()].copy_from_slice(&dto.rows);
+    let value = Pattern::new(dto.width, dto.height, rows);
+    if !value.is_valid() {
+        return Err(corrupt("pattern has non-zero unused bits"));
+    }
+    Ok(value)
+}
+
+fn gradient_shape(dto: GradientShapeDto) -> GradientShape {
+    match dto {
+        GradientShapeDto::Linear => GradientShape::Linear,
+        GradientShapeDto::Radial => GradientShape::Radial,
+    }
+}
+
+fn dither(dto: DitherDto) -> Dither {
+    match dto {
+        DitherDto::None => Dither::None,
+        DitherDto::Constant => Dither::Constant,
+        DitherDto::Checker => Dither::Checker,
+        DitherDto::HorizontalLines => Dither::HorizontalLines,
+        DitherDto::VerticalLines => Dither::VerticalLines,
+        DitherDto::Diagonal => Dither::Diagonal,
+        DitherDto::Crosshatch => Dither::Crosshatch,
+        DitherDto::Halftone => Dither::Halftone,
+        DitherDto::Bayer2 => Dither::Bayer2,
+        DitherDto::Bayer4 => Dither::Bayer4,
+        DitherDto::Bayer8 => Dither::Bayer8,
+        DitherDto::FloydSteinberg => Dither::FloydSteinberg,
+        DitherDto::Atkinson => Dither::Atkinson,
+    }
+}
+
+fn quantize(dto: QuantizeDto) -> QuantizeMode {
+    match dto {
+        QuantizeDto::Overall { steps } => QuantizeMode::Overall(steps),
+        QuantizeDto::PerSegment { steps } => QuantizeMode::PerSegment(steps),
+    }
+}
+
+fn tone_shape(dto: ToneShapeDto) -> ToneShape {
+    match dto {
+        ToneShapeDto::Dot => ToneShape::Dot,
+        ToneShapeDto::Square => ToneShape::Square,
+        ToneShapeDto::Line => ToneShape::Line,
+        ToneShapeDto::Cross => ToneShape::Cross,
+        ToneShapeDto::Bayer => ToneShape::Bayer,
+    }
 }
 
 fn op(dto: &OpDto) -> Result<Op, ReadError> {
@@ -684,13 +818,42 @@ fn op(dto: &OpDto) -> Result<Op, ReadError> {
             antialias,
             clip: mask,
             behind,
+            pattern,
         } => Op::Fill {
             coverage: MaskId(*coverage),
             color: Rgba8(parse_color(color).ok_or_else(|| corrupt("fill colour"))?),
             antialias: *antialias,
             clip: clip(mask),
             behind: *behind,
+            pattern: pattern.as_ref().map(self::pattern).transpose()?,
         },
+        OpDto::Gradient {
+            gradient,
+            shape,
+            from,
+            to,
+            dither: d,
+            quantize: q,
+            opacity,
+            clip: mask,
+        } => {
+            if !from.iter().all(|v| v.is_finite())
+                || !to.iter().all(|v| v.is_finite())
+                || !opacity.is_finite()
+            {
+                return Err(corrupt("gradient parameter is not finite"));
+            }
+            Op::Gradient {
+                gradient: GradientId(*gradient),
+                shape: gradient_shape(*shape),
+                from: *from,
+                to: *to,
+                dither: dither(*d),
+                quantize: quantize(*q),
+                opacity: *opacity,
+                clip: clip(mask),
+            }
+        }
         OpDto::Image {
             image,
             transform,

@@ -55,6 +55,7 @@ pub(crate) fn stroke(x: f32, seed: u64) -> Stroke {
             fade: 0.0,
         },
         seed,
+        pattern: None,
     }
 }
 
@@ -108,6 +109,7 @@ pub(crate) fn sample() -> Document {
             antialias: true,
             clip: None,
             behind: false,
+            pattern: None,
         },
         Op::PlaceImage {
             asset,
@@ -679,8 +681,8 @@ fn animated() -> Document {
         if let LayerKind::Group(group) = &mut layer.kind {
             ugu_core::keys::expose(group.cels.as_mut().unwrap(), 7, None);
         }
-        layer.keys_mut().pivot = [0.5, 1e-3];
-        layer.keys_mut().set(Key {
+        layer.keys_mut().unwrap().pivot = [0.5, 1e-3];
+        layer.keys_mut().unwrap().set(Key {
             frame: 4,
             pose: Pose {
                 offset: [-3.25, 0.1],
@@ -696,7 +698,7 @@ fn animated() -> Document {
     ugu_core::edit::commit(&mut document, changes).unwrap();
     let changes = ugu_core::command::update_layer(&document, paint, |layer| {
         for (frame, ease) in [(0, Ease::Linear), (9, Ease::Hold)] {
-            layer.keys_mut().set(Key {
+            layer.keys_mut().unwrap().set(Key {
                 frame,
                 pose: Pose {
                     offset: [f64::from(frame), 0.0],
@@ -747,11 +749,14 @@ fn keys_and_exposures_read_back_and_are_named_as_required() {
 #[test]
 fn keys_alone_require_only_keys_and_unknown_features_stay_refused() {
     let mut document = sample();
-    document.layers[0].keys_mut().set(ugu_core::keys::Key {
-        frame: 1,
-        pose: ugu_core::keys::Pose::REST,
-        ease: ugu_core::keys::Ease::Linear,
-    });
+    document.layers[0]
+        .keys_mut()
+        .unwrap()
+        .set(ugu_core::keys::Key {
+            frame: 1,
+            pose: ugu_core::keys::Pose::REST,
+            ease: ugu_core::keys::Ease::Linear,
+        });
     let bytes = written(&document);
     assert!(manifest_of(&bytes).ends_with(r#""required":["keys"]}"#));
     assert!(read_bytes(bytes).unwrap().0.layers == document.layers);
@@ -766,14 +771,17 @@ fn keys_alone_require_only_keys_and_unknown_features_stay_refused() {
 #[test]
 fn a_key_that_fades_reads_back_and_is_named_as_required() {
     let mut document = sample();
-    document.layers[0].keys_mut().set(ugu_core::keys::Key {
-        frame: 1,
-        pose: ugu_core::keys::Pose {
-            opacity: 0.25,
-            ..ugu_core::keys::Pose::REST
-        },
-        ease: ugu_core::keys::Ease::Linear,
-    });
+    document.layers[0]
+        .keys_mut()
+        .unwrap()
+        .set(ugu_core::keys::Key {
+            frame: 1,
+            pose: ugu_core::keys::Pose {
+                opacity: 0.25,
+                ..ugu_core::keys::Pose::REST
+            },
+            ease: ugu_core::keys::Ease::Linear,
+        });
     let bytes = written(&document);
     assert!(
         manifest_of(&bytes).ends_with(r#""required":["keys","key-opacity"]}"#),
@@ -977,7 +985,7 @@ fn first_paint(document: &mut Document) -> &mut PaintLayer {
         .iter_mut()
         .find_map(|layer| match &mut layer.kind {
             LayerKind::Paint(paint) => Some(paint),
-            LayerKind::Group(_) => None,
+            LayerKind::Group(_) | LayerKind::Filter(_) => None,
         })
         .expect("the sample has a paint layer")
 }
@@ -1025,4 +1033,155 @@ fn a_stroke_that_fades_reads_back_and_is_named_as_required() {
         read_bytes(bytes).unwrap().0.store.strokes[&id].brush.fade,
         250.0
     );
+}
+
+#[test]
+fn plain_document_omits_gradients_filters_and_patterns_in_json() {
+    let bytes = written(&sample());
+    let json = entries(&bytes)
+        .into_iter()
+        .find(|(name, _)| name == DOCUMENT)
+        .unwrap()
+        .1;
+    let json = String::from_utf8(json).unwrap();
+    for key in ["gradients", "\"filter\"", "pattern"] {
+        assert!(!json.contains(key), "{key} leaked into plain JSON: {json}");
+    }
+}
+
+#[test]
+fn filter_layers_gradients_and_patterns_round_trip_and_gate_features() {
+    use ugu_core::dither::{Dither, Screentone, ToneShape};
+    use ugu_core::gradient::{Gradient, GradientShape, GradientStop, QuantizeMode};
+    use ugu_core::ops::{FilterKind, FilterLayer, GradientId};
+
+    let mut document = sample();
+    let checker = ugu_core::pattern::find("checker-50").unwrap().pattern;
+    let grad = Gradient::new(vec![
+        GradientStop {
+            position: 0.0,
+            color: Rgba8([0, 0, 0, 255]),
+        },
+        GradientStop {
+            position: 0.5,
+            color: Rgba8([255, 128, 0, 128]),
+        },
+        GradientStop {
+            position: 1.0,
+            color: Rgba8([255, 255, 255, 0]),
+        },
+    ]);
+    document.store.gradients.insert(GradientId(0), grad.clone());
+    document
+        .store
+        .strokes
+        .get_mut(&StrokeId(0))
+        .unwrap()
+        .pattern = Some(checker);
+    first_paint(&mut document).ops.push(Op::Gradient {
+        gradient: GradientId(0),
+        shape: GradientShape::Radial,
+        from: [10.0, 12.0],
+        to: [30.0, 40.0],
+        dither: Dither::FloydSteinberg,
+        quantize: QuantizeMode::PerSegment(3),
+        opacity: 0.75,
+        clip: Some(MaskId(0)),
+    });
+    document.layers.push(Layer {
+        id: LayerId(10),
+        name: "GradMap".to_owned(),
+        visible: true,
+        reference: false,
+        kind: LayerKind::Filter(FilterLayer {
+            opacity: 0.8,
+            blend: Blend::Multiply,
+            clip_to_below: true,
+            kind: FilterKind::GradientMap {
+                gradient: grad,
+                dither: Dither::Bayer8,
+                quantize: QuantizeMode::Overall(6),
+            },
+        }),
+    });
+    document.layers.push(Layer {
+        id: LayerId(11),
+        name: "Tone".to_owned(),
+        visible: true,
+        reference: false,
+        kind: LayerKind::Filter(FilterLayer {
+            opacity: 1.0,
+            blend: Blend::Normal,
+            clip_to_below: false,
+            kind: FilterKind::Screentone(Screentone {
+                shape: ToneShape::Dot,
+                size: 12.0,
+                angle: -30.0,
+                dot_color: Rgba8([16, 32, 48, 255]),
+                background: None,
+            }),
+        }),
+    });
+
+    let mut buffer = Vec::new();
+    crate::write::write_with(&document, ID, Some(LayerId(10)), Cursor::new(&mut buffer)).unwrap();
+    let manifest = manifest_of(&buffer);
+    for feature in [FILTER_LAYER_FEATURE, GRADIENT_OP_FEATURE, PATTERN_FEATURE] {
+        assert!(manifest.contains(feature), "missing {feature}: {manifest}");
+    }
+    let (read_doc, _, active) = crate::read::read_with(Cursor::new(buffer)).unwrap();
+    assert_eq!(active, Some(LayerId(10)));
+    assert_eq!(read_doc.layers, document.layers);
+    assert_eq!(read_doc.store.gradients, document.store.gradients);
+    assert_eq!(read_doc.store.strokes[&StrokeId(0)].pattern, Some(checker));
+}
+
+#[test]
+fn invalid_patterns_gradients_and_filters_are_refused() {
+    let mut bad_pat = sample();
+    bad_pat.store.strokes.get_mut(&StrokeId(0)).unwrap().pattern = Some(
+        ugu_core::pattern::Pattern::new(4, 2, [0xff, 0xff, 0, 0, 0, 0, 0, 0]),
+    );
+    assert!(read_bytes(written(&bad_pat)).is_err());
+
+    let mut bad_filter = sample();
+    bad_filter.layers.push(Layer {
+        id: LayerId(10),
+        name: "BadTone".to_owned(),
+        visible: true,
+        reference: false,
+        kind: LayerKind::Filter(ugu_core::ops::FilterLayer {
+            opacity: 1.0,
+            blend: Blend::Normal,
+            clip_to_below: false,
+            kind: ugu_core::ops::FilterKind::Screentone(ugu_core::dither::Screentone {
+                shape: ugu_core::dither::ToneShape::Dot,
+                size: 1.0,
+                angle: 0.0,
+                dot_color: Rgba8([0, 0, 0, 255]),
+                background: None,
+            }),
+        }),
+    });
+    assert!(read_bytes(written(&bad_filter)).is_err());
+
+    let mut bad_grad = sample();
+    bad_grad.store.gradients.insert(
+        ugu_core::ops::GradientId(0),
+        ugu_core::gradient::Gradient::new(vec![ugu_core::gradient::GradientStop {
+            position: 0.0,
+            color: Rgba8([0, 0, 0, 255]),
+        }]),
+    );
+    first_paint(&mut bad_grad).ops.push(Op::Gradient {
+        gradient: ugu_core::ops::GradientId(0),
+        shape: ugu_core::gradient::GradientShape::Linear,
+        from: [0.0, 0.0],
+        to: [10.0, 10.0],
+        dither: ugu_core::dither::Dither::None,
+        quantize: ugu_core::gradient::QuantizeMode::Overall(2),
+        opacity: 1.0,
+        clip: None,
+    });
+    assert!(read_bytes(written(&bad_grad)).is_err());
 }

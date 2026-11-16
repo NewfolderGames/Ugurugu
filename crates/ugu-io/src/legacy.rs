@@ -726,6 +726,7 @@ impl<'a> Importer<'a> {
                     antialias,
                     clip,
                     behind: false,
+                    pattern: None,
                 }
             }
             "image" => {
@@ -817,6 +818,7 @@ impl<'a> Importer<'a> {
                 width: dto.width as f32,
                 brush: brush(&dto.brush)?,
                 seed,
+                pattern: None,
             },
         );
         Ok(id)

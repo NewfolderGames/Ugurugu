@@ -10,9 +10,14 @@
 use std::collections::BTreeSet;
 use std::io::{Seek, Write};
 
+use ugu_core::dither::{Dither, ToneShape};
 use ugu_core::document::{Document, Layer, LayerId, LayerKind};
+use ugu_core::gradient::{GradientShape, GradientStop, QuantizeMode};
 use ugu_core::keys::{Ease, Keys};
-use ugu_core::ops::{AssetId, Blend, MaskId, MotionStyle, Op, Sampling, StrokeId, Wobble};
+use ugu_core::ops::{
+    AssetId, Blend, FilterKind, GradientId, MaskId, MotionStyle, Op, Sampling, StrokeId, Wobble,
+};
+use ugu_core::pattern::Pattern;
 use ugu_core::store::{BrushEngine, Mask, Point, TipShape};
 use zip::CompressionMethod;
 use zip::write::{SimpleFileOptions, ZipWriter};
@@ -54,6 +59,11 @@ impl From<zip::result::ZipError> for WriteError {
 fn required(document: &Document, used: &Used) -> Vec<String> {
     let (keyed, folders) = document.is_animated();
     let long = document.frames > ugu_core::document::limits::FRAMES_BEFORE_3_3;
+    let has_pattern = used.has_pattern_fill
+        || used
+            .strokes
+            .iter()
+            .any(|id| document.store.strokes[id].pattern.is_some());
     [
         (keyed, KEYS_FEATURE),
         (folders, CELS_FEATURE),
@@ -67,6 +77,9 @@ fn required(document: &Document, used: &Used) -> Vec<String> {
             BRUSH_FADE_FEATURE,
         ),
         (outlines(&document.layers), LAYER_OUTLINE_FEATURE),
+        (used.has_filter, FILTER_LAYER_FEATURE),
+        (used.has_gradient_op, GRADIENT_OP_FEATURE),
+        (has_pattern, PATTERN_FEATURE),
     ]
     .into_iter()
     .filter(|(used, _)| *used)
@@ -79,6 +92,7 @@ fn outlines(layers: &[ugu_core::document::Layer]) -> bool {
     layers.iter().any(|layer| match &layer.kind {
         LayerKind::Paint(paint) => paint.outline.is_some(),
         LayerKind::Group(group) => outlines(&group.children),
+        LayerKind::Filter(_) => false,
     })
 }
 
@@ -95,6 +109,7 @@ fn fills_behind(layers: &[ugu_core::document::Layer]) -> bool {
     layers.iter().any(|layer| match &layer.kind {
         ugu_core::document::LayerKind::Paint(paint) => ops_behind(&paint.ops),
         ugu_core::document::LayerKind::Group(group) => fills_behind(&group.children),
+        ugu_core::document::LayerKind::Filter(_) => false,
     })
 }
 
@@ -192,6 +207,7 @@ pub fn write_with<W: Write + Seek>(
                         fade: stroke.brush.fade,
                     },
                     seed: format!("{:016x}", stroke.seed),
+                    pattern: stroke.pattern.map(pattern),
                 }
             })
             .collect(),
@@ -202,6 +218,14 @@ pub fn write_with<W: Write + Seek>(
             .map(|id| ImageDto {
                 id: hex(&id.0),
                 size: document.store.assets[id].size,
+            })
+            .collect(),
+        gradients: used
+            .gradients
+            .iter()
+            .map(|id| GradientEntryDto {
+                id: id.0,
+                stops: stops(&document.store.gradients[id].stops),
             })
             .collect(),
         active_layer: active_layer.map(|id| id.0),
@@ -279,6 +303,10 @@ struct Used {
     strokes: BTreeSet<StrokeId>,
     masks: BTreeSet<MaskId>,
     assets: BTreeSet<AssetId>,
+    gradients: BTreeSet<GradientId>,
+    has_filter: bool,
+    has_gradient_op: bool,
+    has_pattern_fill: bool,
 }
 
 impl Used {
@@ -287,6 +315,7 @@ impl Used {
             match &layer.kind {
                 LayerKind::Paint(paint) => self.ops(&paint.ops),
                 LayerKind::Group(group) => self.layers(&group.children),
+                LayerKind::Filter(_) => self.has_filter = true,
             }
         }
     }
@@ -298,9 +327,22 @@ impl Used {
                     self.strokes.insert(*stroke);
                     self.masks.extend(clip);
                 }
-                Op::Fill { coverage, clip, .. } => {
+                Op::Fill {
+                    coverage,
+                    clip,
+                    pattern,
+                    ..
+                } => {
                     self.masks.insert(*coverage);
                     self.masks.extend(clip);
+                    if pattern.is_some() {
+                        self.has_pattern_fill = true;
+                    }
+                }
+                Op::Gradient { gradient, clip, .. } => {
+                    self.gradients.insert(*gradient);
+                    self.masks.extend(clip);
+                    self.has_gradient_op = true;
                 }
                 Op::PlaceImage { asset, .. } => {
                     self.assets.insert(*asset);
@@ -351,32 +393,31 @@ fn sampling(sampling: Sampling) -> SamplingDto {
 }
 
 fn layer(layer: &Layer) -> LayerDto {
-    let (paint, group) = match &layer.kind {
-        LayerKind::Paint(paint) => (
-            Some(PaintDto {
-                opacity: paint.opacity,
-                blend: blend(paint.blend),
-                clip_to_below: paint.clip_to_below,
-                wobble: paint.wobble.map(wobble),
-                initial_size: paint.initial_size,
-                ops: paint.ops.iter().map(op).collect(),
-                keys: keys(&paint.keys),
-                outline: paint.outline.map(|outline| OutlineDto {
+    let (mut paint, mut group, mut filter) = (None, None, None);
+    match &layer.kind {
+        LayerKind::Paint(p) => {
+            paint = Some(PaintDto {
+                opacity: p.opacity,
+                blend: blend(p.blend),
+                clip_to_below: p.clip_to_below,
+                wobble: p.wobble.map(wobble),
+                initial_size: p.initial_size,
+                ops: p.ops.iter().map(op).collect(),
+                keys: keys(&p.keys),
+                outline: p.outline.map(|outline| OutlineDto {
                     width: outline.width,
                     color: color_hex(outline.color.0),
                 }),
-            }),
-            None,
-        ),
-        LayerKind::Group(group) => (
-            None,
-            Some(GroupDto {
-                opacity: group.opacity,
-                blend: blend(group.blend),
-                clip_to_below: group.clip_to_below,
-                children: group.children.iter().map(self::layer).collect(),
-                keys: keys(&group.keys),
-                cels: group.cels.as_ref().map(|cels| {
+            });
+        }
+        LayerKind::Group(g) => {
+            group = Some(GroupDto {
+                opacity: g.opacity,
+                blend: blend(g.blend),
+                clip_to_below: g.clip_to_below,
+                children: g.children.iter().map(self::layer).collect(),
+                keys: keys(&g.keys),
+                cels: g.cels.as_ref().map(|cels| {
                     cels.iter()
                         .map(|exposure| ExposureDto {
                             frame: exposure.frame,
@@ -384,9 +425,34 @@ fn layer(layer: &Layer) -> LayerDto {
                         })
                         .collect()
                 }),
-            }),
-        ),
-    };
+            });
+        }
+        LayerKind::Filter(f) => {
+            filter = Some(FilterDto {
+                opacity: f.opacity,
+                blend: blend(f.blend),
+                clip_to_below: f.clip_to_below,
+                kind: match &f.kind {
+                    FilterKind::GradientMap {
+                        gradient,
+                        dither,
+                        quantize,
+                    } => FilterKindDto::GradientMap {
+                        stops: stops(&gradient.stops),
+                        dither: self::dither(*dither),
+                        quantize: self::quantize(*quantize),
+                    },
+                    FilterKind::Screentone(tone) => FilterKindDto::Screentone {
+                        shape: tone_shape(tone.shape),
+                        size: tone.size,
+                        angle: tone.angle,
+                        dot_color: color_hex(tone.dot_color.0),
+                        background: tone.background.map(|bg| color_hex(bg.0)),
+                    },
+                },
+            });
+        }
+    }
     LayerDto {
         id: layer.id.0,
         name: layer.name.clone(),
@@ -394,6 +460,66 @@ fn layer(layer: &Layer) -> LayerDto {
         reference: layer.reference,
         paint,
         group,
+        filter,
+    }
+}
+
+fn stops(list: &[GradientStop]) -> Vec<GradientStopDto> {
+    list.iter()
+        .map(|stop| GradientStopDto {
+            position: stop.position,
+            color: color_hex(stop.color.0),
+        })
+        .collect()
+}
+
+fn pattern(p: Pattern) -> PatternDto {
+    PatternDto {
+        width: p.width,
+        height: p.height,
+        rows: p.rows[..usize::from(p.height)].to_vec(),
+    }
+}
+
+fn gradient_shape(shape: GradientShape) -> GradientShapeDto {
+    match shape {
+        GradientShape::Linear => GradientShapeDto::Linear,
+        GradientShape::Radial => GradientShapeDto::Radial,
+    }
+}
+
+fn dither(d: Dither) -> DitherDto {
+    match d {
+        Dither::None => DitherDto::None,
+        Dither::Constant => DitherDto::Constant,
+        Dither::Checker => DitherDto::Checker,
+        Dither::HorizontalLines => DitherDto::HorizontalLines,
+        Dither::VerticalLines => DitherDto::VerticalLines,
+        Dither::Diagonal => DitherDto::Diagonal,
+        Dither::Crosshatch => DitherDto::Crosshatch,
+        Dither::Halftone => DitherDto::Halftone,
+        Dither::Bayer2 => DitherDto::Bayer2,
+        Dither::Bayer4 => DitherDto::Bayer4,
+        Dither::Bayer8 => DitherDto::Bayer8,
+        Dither::FloydSteinberg => DitherDto::FloydSteinberg,
+        Dither::Atkinson => DitherDto::Atkinson,
+    }
+}
+
+fn quantize(q: QuantizeMode) -> QuantizeDto {
+    match q {
+        QuantizeMode::Overall(steps) => QuantizeDto::Overall { steps },
+        QuantizeMode::PerSegment(steps) => QuantizeDto::PerSegment { steps },
+    }
+}
+
+fn tone_shape(shape: ToneShape) -> ToneShapeDto {
+    match shape {
+        ToneShape::Dot => ToneShapeDto::Dot,
+        ToneShape::Square => ToneShapeDto::Square,
+        ToneShape::Line => ToneShapeDto::Line,
+        ToneShape::Cross => ToneShapeDto::Cross,
+        ToneShape::Bayer => ToneShapeDto::Bayer,
     }
 }
 
@@ -413,12 +539,33 @@ fn op(op: &Op) -> OpDto {
             antialias,
             clip,
             behind,
+            pattern,
         } => OpDto::Fill {
             coverage: coverage.0,
             color: color_hex(color.0),
             antialias: *antialias,
             clip: clip.map(|mask| mask.0),
             behind: *behind,
+            pattern: pattern.map(self::pattern),
+        },
+        Op::Gradient {
+            gradient,
+            shape,
+            from,
+            to,
+            dither,
+            quantize,
+            opacity,
+            clip,
+        } => OpDto::Gradient {
+            gradient: gradient.0,
+            shape: gradient_shape(*shape),
+            from: *from,
+            to: *to,
+            dither: self::dither(*dither),
+            quantize: self::quantize(*quantize),
+            opacity: *opacity,
+            clip: clip.map(|mask| mask.0),
         },
         Op::PlaceImage {
             asset,

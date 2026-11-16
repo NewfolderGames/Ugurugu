@@ -24,7 +24,13 @@ pub const FILL_BEHIND_FEATURE: &str = "fill-behind";
 /// A line around a layer, which 3.5 would leave out.
 pub const LAYER_OUTLINE_FEATURE: &str = "layer-outline";
 pub const BRUSH_FADE_FEATURE: &str = "brush-fade";
-pub const FEATURES: [&str; 7] = [
+/// Layers applying pixel filters (gradient map or screentone) to layers below.
+pub const FILTER_LAYER_FEATURE: &str = "filter-layer";
+/// Gradient draw operations on paint layers.
+pub const GRADIENT_OP_FEATURE: &str = "gradient-op";
+/// 1-bit pixel patterns on strokes and fills.
+pub const PATTERN_FEATURE: &str = "pattern";
+pub const FEATURES: [&str; 10] = [
     KEYS_FEATURE,
     CELS_FEATURE,
     FRAMES_FEATURE,
@@ -32,6 +38,9 @@ pub const FEATURES: [&str; 7] = [
     FILL_BEHIND_FEATURE,
     BRUSH_FADE_FEATURE,
     LAYER_OUTLINE_FEATURE,
+    FILTER_LAYER_FEATURE,
+    GRADIENT_OP_FEATURE,
+    PATTERN_FEATURE,
 ];
 
 pub const MANIFEST: &str = "manifest.json";
@@ -79,7 +88,9 @@ pub struct DocumentDto {
     pub strokes: Vec<StrokeDto>,
     pub masks: Vec<MaskDto>,
     pub images: Vec<ImageDto>,
-    /// The paint layer being edited when saved, chosen again when opened,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gradients: Vec<GradientEntryDto>,
+    /// The paint or filter layer being edited when saved, chosen again when opened,
     /// as 2.2.13 keeps `activeLayerId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_layer: Option<u32>,
@@ -114,11 +125,13 @@ pub struct LayerDto {
     pub name: String,
     pub visible: bool,
     pub reference: bool,
-    /// Exactly one of `paint` and `group` is present.
+    /// Exactly one of `paint`, `group`, or `filter` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paint: Option<PaintDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<GroupDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<FilterDto>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -240,6 +253,18 @@ pub enum OpDto {
         clip: Option<u32>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         behind: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<PatternDto>,
+    },
+    Gradient {
+        gradient: u32,
+        shape: GradientShapeDto,
+        from: [f32; 2],
+        to: [f32; 2],
+        dither: DitherDto,
+        quantize: QuantizeDto,
+        opacity: f32,
+        clip: Option<u32>,
     },
     Image {
         image: String,
@@ -279,6 +304,99 @@ pub struct StrokeDto {
     pub brush: BrushDto,
     /// 16 hex digits: a u64 does not fit a JSON number exactly.
     pub seed: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<PatternDto>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatternDto {
+    pub width: u8,
+    pub height: u8,
+    pub rows: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GradientEntryDto {
+    pub id: u32,
+    pub stops: Vec<GradientStopDto>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GradientStopDto {
+    pub position: f32,
+    pub color: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GradientShapeDto {
+    Linear,
+    Radial,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DitherDto {
+    None,
+    Constant,
+    Checker,
+    HorizontalLines,
+    VerticalLines,
+    Diagonal,
+    Crosshatch,
+    Halftone,
+    Bayer2,
+    Bayer4,
+    Bayer8,
+    FloydSteinberg,
+    Atkinson,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum QuantizeDto {
+    Overall { steps: u8 },
+    PerSegment { steps: u8 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToneShapeDto {
+    Dot,
+    Square,
+    Line,
+    Cross,
+    Bayer,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilterDto {
+    pub opacity: f32,
+    pub blend: BlendDto,
+    pub clip_to_below: bool,
+    pub kind: FilterKindDto,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "filter", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FilterKindDto {
+    GradientMap {
+        stops: Vec<GradientStopDto>,
+        dither: DitherDto,
+        quantize: QuantizeDto,
+    },
+    Screentone {
+        shape: ToneShapeDto,
+        size: f32,
+        angle: f32,
+        dot_color: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]

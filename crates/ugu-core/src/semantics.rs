@@ -107,16 +107,32 @@ impl Rect {
 
 #[derive(Default)]
 struct World {
-    strokes: HashMap<StrokeId, (Rect, [f32; 4])>,
+    strokes: HashMap<StrokeId, (Rect, [f32; 4], Option<crate::pattern::Pattern>)>,
     masks: HashMap<MaskId, Rect>,
     /// Each image's width and premultiplied pixels, row by row.
     images: HashMap<AssetId, (i32, Vec<[f32; 4]>)>,
+    gradients: HashMap<GradientId, crate::gradient::Gradient>,
 }
 
 impl World {
     fn stroke(&mut self, rect: [i32; 4], color: [f32; 4]) -> StrokeId {
+        self.patterned_stroke(rect, color, None)
+    }
+
+    fn patterned_stroke(
+        &mut self,
+        rect: [i32; 4],
+        color: [f32; 4],
+        pattern: Option<crate::pattern::Pattern>,
+    ) -> StrokeId {
         let id = StrokeId(self.strokes.len() as u32);
-        self.strokes.insert(id, (Rect(rect), color));
+        self.strokes.insert(id, (Rect(rect), color, pattern));
+        id
+    }
+
+    fn gradient(&mut self, gradient: crate::gradient::Gradient) -> GradientId {
+        let id = GradientId(self.gradients.len() as u32);
+        self.gradients.insert(id, gradient);
         id
     }
 
@@ -140,7 +156,7 @@ impl World {
         for op in ops {
             match op {
                 Op::Paint { stroke, clip } | Op::Erase { stroke, clip } => {
-                    let (rect, color) = &self.strokes[stroke];
+                    let (rect, color, pattern) = &self.strokes[stroke];
                     let shift = if frame % 2 == 1 {
                         wobble.amount as i32
                     } else {
@@ -151,7 +167,9 @@ impl World {
                             continue;
                         }
                         if matches!(op, Op::Paint { .. }) {
-                            surface.over(x, y, *color);
+                            if pattern.is_none_or(|p| p.contains(x, y)) {
+                                surface.over(x, y, *color);
+                            }
                         } else {
                             surface.set(x, y, CLEAR);
                         }
@@ -166,12 +184,13 @@ impl World {
                     antialias,
                     clip,
                     behind,
+                    pattern,
                 } => {
                     let [r, g, b, a] = color.0.map(|c| f32::from(c) / 255.0);
                     let color = [r * a, g * a, b * a, a];
                     let covered: Vec<_> = self.masks[coverage].cells().collect();
                     for &(x, y) in &covered {
-                        if !self.masked(*clip, x, y) {
+                        if !self.masked(*clip, x, y) || !pattern.is_none_or(|p| p.contains(x, y)) {
                             continue;
                         }
                         if *behind {
@@ -189,8 +208,80 @@ impl World {
                         fringe.sort_unstable();
                         fringe.dedup();
                         for (x, y) in fringe {
-                            if self.masked(*clip, x, y) {
+                            if self.masked(*clip, x, y) && pattern.is_none_or(|p| p.contains(x, y))
+                            {
                                 surface.under(x, y, color);
+                            }
+                        }
+                    }
+                }
+                Op::Gradient {
+                    gradient,
+                    shape,
+                    from,
+                    to,
+                    dither,
+                    quantize,
+                    opacity,
+                    clip,
+                } => {
+                    let g = &self.gradients[gradient];
+                    let ramp = crate::gradient::QuantizedRamp::new(g, *quantize);
+                    let dx = f64::from(to[0] - from[0]);
+                    let dy = f64::from(to[1] - from[1]);
+                    let len2 = dx * dx + dy * dy;
+                    let len = len2.sqrt();
+                    let gradient_t = |x: i32, y: i32| -> u32 {
+                        let px = f64::from(x) + 0.5;
+                        let py = f64::from(y) + 0.5;
+                        let t = match shape {
+                            crate::gradient::GradientShape::Linear => {
+                                if len2 <= 0.0 {
+                                    1.0
+                                } else {
+                                    ((px - f64::from(from[0])) * dx
+                                        + (py - f64::from(from[1])) * dy)
+                                        / len2
+                                }
+                            }
+                            crate::gradient::GradientShape::Radial => {
+                                if len <= 0.0 {
+                                    1.0
+                                } else {
+                                    (px - f64::from(from[0])).hypot(py - f64::from(from[1])) / len
+                                }
+                            }
+                        };
+                        crate::gradient::to_q16(t as f32)
+                    };
+                    let lay = |surface: &mut Surface, x: i32, y: i32, sample: Rgba8| {
+                        let [r, g_ch, b, a] = sample.0.map(|c| f32::from(c) / 255.0);
+                        let alpha = a * *opacity;
+                        surface.over(x, y, [r * alpha, g_ch * alpha, b * alpha, alpha]);
+                    };
+                    if dither.is_error_diffusion() {
+                        crate::dither::diffuse_plane(
+                            &ramp,
+                            *dither,
+                            surface.size[0] as usize,
+                            surface.size[1] as usize,
+                            |x, y| {
+                                self.masked(*clip, x as i32, y as i32)
+                                    .then(|| gradient_t(x as i32, y as i32))
+                            },
+                            |x, y, sample| lay(surface, x as i32, y as i32, sample),
+                        );
+                    } else {
+                        for y in 0..surface.size[1] as i32 {
+                            for x in 0..surface.size[0] as i32 {
+                                if !self.masked(*clip, x, y) {
+                                    continue;
+                                }
+                                let t_q16 = gradient_t(x, y);
+                                let sample = crate::dither::sample_positioned(
+                                    g, &ramp, *dither, t_q16, x, y,
+                                );
+                                lay(surface, x, y, sample);
                             }
                         }
                     }
@@ -307,10 +398,14 @@ impl World {
     }
 
     fn size_of(&self, layers: &[Layer]) -> [u32; 2] {
-        match &layers.first().expect("a layer").kind {
-            LayerKind::Paint(paint) => paint.final_size(),
-            LayerKind::Group(group) => self.size_of(&group.children),
+        for layer in layers {
+            match &layer.kind {
+                LayerKind::Paint(paint) => return paint.final_size(),
+                LayerKind::Group(group) => return self.size_of(&group.children),
+                LayerKind::Filter(_) => {}
+            }
         }
+        panic!("a layer")
     }
 
     /// `shift` is how far the groups holding `layers` move them on `frame`;
@@ -321,10 +416,39 @@ impl World {
             let (blend, opacity, clipped) = match &layer.kind {
                 LayerKind::Paint(paint) => (paint.blend, paint.opacity, paint.clip_to_below),
                 LayerKind::Group(group) => (group.blend, group.opacity, group.clip_to_below),
+                LayerKind::Filter(filter) => (filter.blend, filter.opacity, filter.clip_to_below),
             };
             if !layer.visible || opacity <= 0.0 {
                 if !clipped {
                     base = None;
+                }
+                continue;
+            }
+            if let LayerKind::Filter(filter) = &layer.kind {
+                let filtered = filter_surface(result, filter);
+                if clipped && base.is_none() {
+                    continue;
+                }
+                for (index, (target, source)) in
+                    result.pixels.iter_mut().zip(&filtered.pixels).enumerate()
+                {
+                    let cover = if clipped {
+                        let Some((below, below_opacity)) = &base else {
+                            unreachable!("checked above");
+                        };
+                        below.pixels[index][3] * below_opacity
+                    } else {
+                        1.0
+                    };
+                    let w = (opacity * cover).clamp(0.0, 1.0);
+                    if blend == Blend::Normal {
+                        *target = std::array::from_fn(|c| target[c] * (1.0 - w) + source[c] * w);
+                    } else {
+                        *target = blend_over(blend, source.map(|c| c * w), *target);
+                    }
+                }
+                if !clipped {
+                    base = Some((result.clone(), 1.0));
                 }
                 continue;
             }
@@ -346,6 +470,7 @@ impl World {
                     self.children(&shown, frame, shift, &mut surface);
                     surface
                 }
+                LayerKind::Filter(_) => unreachable!(),
             };
             if clipped {
                 let Some((base, base_opacity)) = &base else {
@@ -545,6 +670,7 @@ fn a_fill_keeps_its_coverage_while_lines_move() {
         antialias: false,
         clip: None,
         behind: false,
+        pattern: None,
     };
     let mut filled = layer(vec![fill, paint(outline)], [4, 3]);
     filled.wobble = Some(Wobble::classic(1.0));
@@ -573,6 +699,7 @@ fn a_fill_replaces_what_it_covers_and_goes_behind_its_edge() {
         antialias,
         clip: None,
         behind: false,
+        pattern: None,
     };
     let green = [0.0, 128.0 / 255.0, 0.0, 128.0 / 255.0];
     let plain = world.layer(&layer(vec![paint(under), fill(false)], [6, 1]), 0);
@@ -812,7 +939,7 @@ fn blend_modes_follow_the_w3c_formulas() {
 
 fn keyed(mut layer: Layer, keys: &[(u32, i32)]) -> Layer {
     for &(frame, x) in keys {
-        layer.keys_mut().set(crate::keys::Key {
+        layer.keys_mut().unwrap().set(crate::keys::Key {
             frame,
             pose: crate::keys::Pose {
                 offset: [f64::from(x), 0.0],
@@ -916,4 +1043,240 @@ fn an_animation_folder_shows_the_cel_exposed_on_each_frame() {
     assert_eq!(at(2), [RED, CLEAR]);
     assert_eq!(at(5), [CLEAR, BLUE]);
     assert_eq!(at(7), [CLEAR, CLEAR]);
+}
+
+fn filter_surface(backdrop: &Surface, filter: &FilterLayer) -> Surface {
+    let mut out = Surface::new(backdrop.size);
+    let [w, h] = backdrop.size;
+    match &filter.kind {
+        FilterKind::GradientMap {
+            gradient,
+            dither,
+            quantize,
+        } => {
+            let ramp = crate::gradient::QuantizedRamp::new(gradient, *quantize);
+            let t_for = |p: [f32; 4]| -> Option<u32> {
+                if p[3] <= 0.0 {
+                    return None;
+                }
+                let u8s = p.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+                let straight = Rgba8::from_premultiplied(u8s);
+                Some(crate::dither::luma_q16([
+                    straight.0[0],
+                    straight.0[1],
+                    straight.0[2],
+                ]))
+            };
+            if dither.is_error_diffusion() {
+                crate::dither::diffuse_plane(
+                    &ramp,
+                    *dither,
+                    w as usize,
+                    h as usize,
+                    |x, y| t_for(backdrop.at(x as i32, y as i32)),
+                    |x, y, mapped| {
+                        let p = backdrop.at(x as i32, y as i32);
+                        let [r, g, b, a] = mapped.0.map(|c| f32::from(c) / 255.0);
+                        let out_a = a * p[3];
+                        out.set(x as i32, y as i32, [r * out_a, g * out_a, b * out_a, out_a]);
+                    },
+                );
+            } else {
+                for y in 0..h as i32 {
+                    for x in 0..w as i32 {
+                        let p = backdrop.at(x, y);
+                        let Some(t) = t_for(p) else {
+                            continue;
+                        };
+                        let mapped =
+                            crate::dither::sample_positioned(gradient, &ramp, *dither, t, x, y);
+                        let [r, g, b, a] = mapped.0.map(|c| f32::from(c) / 255.0);
+                        let out_a = a * p[3];
+                        out.set(x, y, [r * out_a, g * out_a, b * out_a, out_a]);
+                    }
+                }
+            }
+        }
+        FilterKind::Screentone(tone) => {
+            let grid = crate::dither::ScreentoneGrid::new(tone, 1);
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let p = backdrop.at(x, y);
+                    if p[3] <= 0.0 {
+                        continue;
+                    }
+                    let u8s = p.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+                    let straight = Rgba8::from_premultiplied(u8s);
+                    let luma =
+                        crate::dither::luma_u16([straight.0[0], straight.0[1], straight.0[2]]);
+                    let dot = grid.is_dot(x, y, luma);
+                    let chosen = if dot {
+                        Some(tone.dot_color)
+                    } else {
+                        tone.background
+                    };
+                    let pixel = match chosen {
+                        Some(c) => {
+                            let [r, g, b, a] = c.0.map(|v| f32::from(v) / 255.0);
+                            let out_a = a * p[3];
+                            [r * out_a, g * out_a, b * out_a, out_a]
+                        }
+                        None => p,
+                    };
+                    out.set(x, y, pixel);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_patterned_stroke_and_fill_leave_unset_cells_alone() {
+    let mut world = World::default();
+    let checker = crate::pattern::find("checker-50").unwrap().pattern;
+    let base = world.stroke([0, 0, 2, 2], RED);
+    let over = world.patterned_stroke([0, 0, 2, 2], BLUE, Some(checker));
+    let result = world.layer(&layer(vec![paint(base), paint(over)], [2, 2]), 0);
+    // Checker sets (0,0) and (1,1); (1,0) and (0,1) stay red.
+    assert_eq!(result.at(0, 0), BLUE);
+    assert_eq!(result.at(1, 0), RED);
+    assert_eq!(result.at(0, 1), RED);
+    assert_eq!(result.at(1, 1), BLUE);
+
+    let area = world.mask([0, 0, 2, 2]);
+    let fill = Op::Fill {
+        coverage: area,
+        color: Rgba8([0, 255, 0, 255]),
+        antialias: false,
+        clip: None,
+        behind: false,
+        pattern: Some(checker),
+    };
+    let filled = world.layer(&layer(vec![paint(base), fill], [2, 2]), 0);
+    assert_eq!(filled.at(0, 0), GREEN);
+    assert_eq!(filled.at(1, 0), RED);
+    assert_eq!(filled.at(0, 1), RED);
+    assert_eq!(filled.at(1, 1), GREEN);
+}
+
+#[test]
+fn a_gradient_op_stays_inside_its_clip_and_moves_with_crop() {
+    let mut world = World::default();
+    let g = world.gradient(crate::gradient::Gradient::default());
+    let clip = world.mask([0, 0, 2, 1]);
+    let grad = Op::Gradient {
+        gradient: g,
+        shape: crate::gradient::GradientShape::Linear,
+        from: [0.0, 0.5],
+        to: [2.0, 0.5],
+        dither: crate::dither::Dither::Constant,
+        quantize: crate::gradient::QuantizeMode::Overall(2),
+        opacity: 1.0,
+        clip: Some(clip),
+    };
+    let res = world.layer(
+        &layer(
+            vec![
+                grad,
+                Op::Crop {
+                    offset: [1, 1],
+                    size: [3, 2],
+                },
+            ],
+            [2, 2],
+        ),
+        0,
+    );
+    assert_eq!(res.at(0, 0), CLEAR);
+    assert_eq!(res.at(1, 0), CLEAR);
+    assert_eq!(res.at(1, 1), [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(res.at(2, 1), [1.0, 1.0, 1.0, 1.0]);
+}
+
+#[test]
+fn a_filter_layer_transforms_what_came_before_in_its_group_or_document() {
+    let mut world = World::default();
+    let red = world.stroke([0, 0, 2, 1], RED);
+    let blue = world.stroke([1, 0, 3, 1], BLUE);
+    let bw = crate::gradient::Gradient::default();
+    let invert = crate::gradient::Gradient::new(vec![
+        crate::gradient::GradientStop {
+            position: 0.0,
+            color: Rgba8([255, 255, 255, 255]),
+        },
+        crate::gradient::GradientStop {
+            position: 1.0,
+            color: Rgba8([0, 0, 0, 255]),
+        },
+    ]);
+    let filter = Layer {
+        id: LayerId(5),
+        name: "Filter".to_owned(),
+        visible: true,
+        reference: false,
+        kind: LayerKind::Filter(FilterLayer {
+            opacity: 1.0,
+            blend: Blend::Normal,
+            clip_to_below: false,
+            kind: FilterKind::GradientMap {
+                gradient: invert,
+                dither: crate::dither::Dither::Constant,
+                quantize: crate::gradient::QuantizeMode::PerSegment(1),
+            },
+        }),
+    };
+    let _ = bw;
+    let group = group_of(10, vec![shown(1, &[red], [3, 1]), filter], None);
+    let result = world.tree(&[group, shown(2, &[blue], [3, 1])], 0, CLEAR);
+    // Red inside the group (luma ~0.21 < 0.5) maps to white; blue above the group stays blue.
+    assert_eq!(result.at(0, 0), [1.0, 1.0, 1.0, 1.0]);
+    assert_eq!(result.at(1, 0), BLUE);
+    assert_eq!(result.at(2, 0), BLUE);
+}
+
+#[test]
+fn a_clipped_filter_layer_leaves_uncovered_pixels_untouched() {
+    let mut world = World::default();
+    let red = world.stroke([0, 0, 2, 1], RED);
+    let blue = world.stroke([1, 0, 2, 1], BLUE);
+    let white = crate::gradient::Gradient::new(vec![
+        crate::gradient::GradientStop {
+            position: 0.0,
+            color: Rgba8([255, 255, 255, 255]),
+        },
+        crate::gradient::GradientStop {
+            position: 1.0,
+            color: Rgba8([255, 255, 255, 255]),
+        },
+    ]);
+    let clipped_filter = Layer {
+        id: LayerId(5),
+        name: "Clipped Filter".to_owned(),
+        visible: true,
+        reference: false,
+        kind: LayerKind::Filter(FilterLayer {
+            opacity: 1.0,
+            blend: Blend::Normal,
+            clip_to_below: true,
+            kind: FilterKind::GradientMap {
+                gradient: white,
+                dither: crate::dither::Dither::Constant,
+                quantize: crate::gradient::QuantizeMode::PerSegment(1),
+            },
+        }),
+    };
+    let result = world.tree(
+        &[
+            shown(1, &[red], [2, 1]),
+            shown(2, &[blue], [2, 1]),
+            clipped_filter,
+        ],
+        0,
+        CLEAR,
+    );
+    // (0,0) is red below the base (not covered by blue), so it stays red.
+    assert_eq!(result.at(0, 0), RED);
+    // (1,0) is covered by blue base, so the white gradient map turns it white.
+    assert_eq!(result.at(1, 0), [1.0, 1.0, 1.0, 1.0]);
 }

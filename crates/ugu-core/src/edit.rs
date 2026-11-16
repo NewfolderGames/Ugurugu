@@ -9,7 +9,8 @@
 //! never keeps half an edit.
 
 use crate::document::{Document, DocumentError, Layer, LayerId, LayerKind};
-use crate::ops::{AssetId, MaskId, Op, Rgba8, StrokeId, Wobble};
+use crate::gradient::Gradient;
+use crate::ops::{AssetId, GradientId, MaskId, Op, Rgba8, StrokeId, Wobble};
 use crate::store::{self, Asset, Mask, StoreError, Stroke};
 
 /// Document-wide settings, changed together.
@@ -31,6 +32,8 @@ pub enum Change {
     RemoveMask(MaskId),
     InsertAsset(AssetId, Asset),
     RemoveAsset(AssetId),
+    InsertGradient(GradientId, Gradient),
+    RemoveGradient(GradientId),
     /// Into a paint layer's top-level operations.
     InsertOp {
         layer: LayerId,
@@ -164,7 +167,7 @@ impl Document {
         };
         match find_mut(&mut self.layers, parent).map(|layer| &mut layer.kind) {
             Some(LayerKind::Group(group)) => Ok(&mut group.children),
-            Some(LayerKind::Paint(_)) => Err(EditError::NotGroup(parent)),
+            Some(LayerKind::Paint(_) | LayerKind::Filter(_)) => Err(EditError::NotGroup(parent)),
             None => Err(EditError::NoSuchLayer(parent)),
         }
     }
@@ -172,7 +175,7 @@ impl Document {
     fn paint_ops_mut(&mut self, id: LayerId) -> Result<&mut Vec<Op>, EditError> {
         match find_mut(&mut self.layers, id).map(|layer| &mut layer.kind) {
             Some(LayerKind::Paint(paint)) => Ok(&mut paint.ops),
-            Some(LayerKind::Group(_)) => Err(EditError::NotPaintLayer(id)),
+            Some(LayerKind::Group(_) | LayerKind::Filter(_)) => Err(EditError::NotPaintLayer(id)),
             None => Err(EditError::NoSuchLayer(id)),
         }
     }
@@ -185,7 +188,7 @@ fn find(layers: &[Layer], id: LayerId) -> Option<&Layer> {
         }
         match &layer.kind {
             LayerKind::Group(group) => find(&group.children, id),
-            LayerKind::Paint(_) => None,
+            LayerKind::Paint(_) | LayerKind::Filter(_) => None,
         }
     })
 }
@@ -197,7 +200,7 @@ fn find_mut(layers: &mut [Layer], id: LayerId) -> Option<&mut Layer> {
         }
         match &mut layer.kind {
             LayerKind::Group(group) => find_mut(&mut group.children, id),
-            LayerKind::Paint(_) => None,
+            LayerKind::Paint(_) | LayerKind::Filter(_) => None,
         }
     })
 }
@@ -213,7 +216,7 @@ fn position(
         }
         match &layer.kind {
             LayerKind::Group(group) => position(&group.children, Some(layer.id), id),
-            LayerKind::Paint(_) => None,
+            LayerKind::Paint(_) | LayerKind::Filter(_) => None,
         }
     })
 }
@@ -259,6 +262,18 @@ impl Change {
             Self::RemoveAsset(id) => {
                 let asset = store.assets.remove(&id).ok_or(EditError::NoSuchData)?;
                 Self::InsertAsset(id, asset)
+            }
+            Self::InsertGradient(id, gradient) => {
+                if store.gradients.contains_key(&id) {
+                    return Err(EditError::IdInUse);
+                }
+                store::check_gradient(id, &gradient).map_err(EditError::Store)?;
+                store.gradients.insert(id, gradient);
+                Self::RemoveGradient(id)
+            }
+            Self::RemoveGradient(id) => {
+                let gradient = store.gradients.remove(&id).ok_or(EditError::NoSuchData)?;
+                Self::InsertGradient(id, gradient)
             }
             Self::InsertOp { layer, index, op } => {
                 let ops = document.paint_ops_mut(layer)?;

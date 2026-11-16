@@ -108,7 +108,9 @@ impl LayerRevisions {
                 | Change::InsertMask(..)
                 | Change::RemoveMask(_)
                 | Change::InsertAsset(..)
-                | Change::RemoveAsset(_) => {}
+                | Change::RemoveAsset(_)
+                | Change::InsertGradient(..)
+                | Change::RemoveGradient(_) => {}
             }
         }
     }
@@ -136,6 +138,7 @@ impl LayerRevisions {
                     }
                 }
             }
+            (LayerKind::Filter(_), LayerKind::Filter(_)) => {}
             _ => self.touch(after),
         }
     }
@@ -419,6 +422,7 @@ fn held(entry: &Entry) -> usize {
                 Change::InsertStroke(_, stroke) => stroke.points.len() * 12,
                 Change::InsertMask(_, mask) => mask.bits.len(),
                 Change::InsertAsset(_, asset) => asset.png.len(),
+                Change::InsertGradient(_, gradient) => gradient.stops.len() * 8,
                 Change::InsertLayer { layer, .. } | Change::ReplaceLayer(layer) => {
                     operations(layer) * std::mem::size_of::<Op>()
                 }
@@ -439,6 +443,7 @@ fn operations(layer: &Layer) -> usize {
     match &layer.kind {
         LayerKind::Paint(paint) => count(&paint.ops),
         LayerKind::Group(group) => group.children.iter().map(operations).sum(),
+        LayerKind::Filter(_) => 1,
     }
 }
 
@@ -518,6 +523,7 @@ mod tests {
                 ..Brush::default()
             },
             seed: 1,
+            pattern: None,
         }
     }
 
