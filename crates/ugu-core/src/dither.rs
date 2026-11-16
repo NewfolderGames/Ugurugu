@@ -367,7 +367,7 @@ fn cos_q15_from_q16(phase_q16: i32) -> i32 {
 }
 
 /// Precomputed rotated screen grid for fast row evaluation of [`Screentone`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScreentoneGrid {
     shape: ToneShape,
     /// `cos(angle) / period` and `sin(angle) / period` in `Q16` cell units/px.

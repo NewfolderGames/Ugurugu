@@ -34,7 +34,7 @@ fn draw(session: &mut Session, tools: &Tools, from: f64, to: f64) -> Outcome {
 fn ops(session: &Session, layer: LayerId) -> Vec<Op> {
     match &session.document().layer(layer).unwrap().kind {
         LayerKind::Paint(paint) => paint.ops.clone(),
-        LayerKind::Group(_) => unreachable!(),
+        LayerKind::Group(_) | LayerKind::Filter(_) => unreachable!(),
     }
 }
 
@@ -509,6 +509,7 @@ fn pen_up_cost_on_a_large_document() {
                     ..Brush::default()
                 },
                 seed: u64::from(index),
+                pattern: None,
             },
         );
         paint.ops.push(Op::Paint {
@@ -1369,6 +1370,7 @@ fn paint_layers(layers: &[Layer]) -> Vec<LayerId> {
         .flat_map(|layer| match &layer.kind {
             LayerKind::Paint(_) => vec![layer.id],
             LayerKind::Group(group) => paint_layers(&group.children),
+            LayerKind::Filter(_) => Vec::new(),
         })
         .collect()
 }
@@ -2774,7 +2776,7 @@ fn a_cel_added_to_draw_on_is_one_step_with_the_drawing_and_gone_without_it() {
     session.expose(None).unwrap();
     let cels = |session: &Session| match &session.document().layer(folder).unwrap().kind {
         LayerKind::Group(group) => group.children.len(),
-        LayerKind::Paint(_) => unreachable!(),
+        LayerKind::Paint(_) | LayerKind::Filter(_) => unreachable!(),
     };
     let label = session.undo_label().map(str::to_owned);
     // A stroke given up leaves no cel and no step.
@@ -3202,4 +3204,131 @@ fn only_a_stroke_drawn_by_hand_with_the_brush_fades() {
     tools.plain.pen.preset = ugu_core::brush::find("pixel-pencil").unwrap();
     drawing.begin_stroke(&tools, at(10.0, 10.0, 0.0)).unwrap();
     assert_eq!(brush_of(&drawing).fade, 0.0);
+}
+
+#[test]
+fn gradient_tool_commits_undoes_and_uses_pen_color_or_cel() {
+    use ugu_core::gradient::GradientShape;
+
+    let tools = Tools {
+        tool: Tool::Gradient,
+        color: Rgba8([200, 30, 40, 255]),
+        gradient: GradientSettings {
+            use_pen_color: true,
+            shape: GradientShape::Linear,
+            ..GradientSettings::default()
+        },
+        ..Tools::default()
+    };
+
+    let mut session = session();
+    session.begin_gradient(&tools, [10.0, 10.0]).unwrap();
+    // 15-degree snap on roughly 45 degrees stays near diagonal.
+    assert!(session.drag_gradient([50.0, 48.0], true));
+    let live = session.live_gradient().unwrap();
+    assert!((live.to[1] - live.to[0]).abs() < 2.0);
+    assert_eq!(live.gradient.stops[0].color.0[..3], [200, 30, 40]);
+    let layer = session.current_layer();
+    assert!(matches!(
+        session.end_gradient([50.0, 50.0], true).unwrap(),
+        Outcome::Committed(_)
+    ));
+    assert!(session.live_gradient().is_none());
+    assert!(
+        ops(&session, layer)
+            .iter()
+            .any(|op| matches!(op, Op::Gradient { .. }))
+    );
+
+    // Cancelling on an animation folder retracts the auto-created cel.
+    session.make_animation_folder().unwrap();
+    let folder = session.folder().unwrap();
+    session.set_frame(5).unwrap();
+    session.expose(None).unwrap();
+    let cels_before = match &session.document().layer(folder).unwrap().kind {
+        LayerKind::Group(g) => g.children.len(),
+        _ => unreachable!(),
+    };
+    session.begin_gradient(&tools, [5.0, 5.0]).unwrap();
+    assert!(session.cancel_gradient());
+    let cels_after = match &session.document().layer(folder).unwrap().kind {
+        LayerKind::Group(g) => g.children.len(),
+        _ => unreachable!(),
+    };
+    assert_eq!(cels_before, cels_after);
+    assert_eq!(session.current_layer(), folder);
+}
+
+#[test]
+fn filter_layer_lifecycle_and_paint_refusal() {
+    use ugu_core::ops::FilterKind;
+
+    let tools = Tools::default();
+    let mut session = session();
+    let paint_id = session.current_layer();
+    assert!(matches!(
+        session.add_filter_layer(FilterKind::default()).unwrap(),
+        Outcome::Committed(_)
+    ));
+    let filter_id = session.current_layer();
+    assert_ne!(filter_id, paint_id);
+    assert!(session.is_filter_layer(filter_id));
+    assert!(session.can_duplicate_layer());
+    assert!(session.can_remove_layer());
+
+    // Paint, fill, and gradient tools cannot draw onto a filter layer.
+    assert!(matches!(
+        session.begin_stroke(&tools, at(10.0, 10.0, 0.0)),
+        Err(StrokeRefused::NoLayer)
+    ));
+    assert!(matches!(
+        session.begin_gradient(&tools, [10.0, 10.0]),
+        Err(StrokeRefused::NoLayer)
+    ));
+    assert!(matches!(session.select_all(), Ok(true)));
+    assert!(matches!(
+        session.fill_selection(&tools),
+        Err(FillError::NoLayer)
+    ));
+
+    // Selecting the sole paint layer forbids removing it even though a filter layer exists.
+    session.select_layer(paint_id).unwrap();
+    assert!(!session.can_remove_layer());
+}
+
+#[test]
+fn pattern_applies_to_pen_and_fill_but_not_eraser_or_shape() {
+    let checker = ugu_core::pattern::find("checker-50").unwrap().pattern;
+    let mut tools = Tools {
+        pattern: Some(checker),
+        ..Tools::default()
+    };
+
+    let mut session = session();
+    tools.tool = Tool::Pen;
+    session.begin_stroke(&tools, at(10.0, 10.0, 0.0)).unwrap();
+    assert_eq!(session.live().unwrap().template.pattern, Some(checker));
+    session.cancel_stroke();
+
+    tools.tool = Tool::Eraser;
+    session.begin_stroke(&tools, at(10.0, 10.0, 0.0)).unwrap();
+    assert_eq!(session.live().unwrap().template.pattern, None);
+    session.cancel_stroke();
+
+    tools.tool = Tool::Shape;
+    session.begin_shape(&tools, [10.0, 10.0]).unwrap();
+    assert_eq!(session.live().unwrap().template.pattern, None);
+    session.cancel_stroke();
+
+    tools.tool = Tool::Fill;
+    session.select_all().unwrap();
+    session.fill_selection(&tools).unwrap();
+    let ops = ops(&session, session.current_layer());
+    assert!(ops.iter().any(|op| matches!(
+        op,
+        Op::Fill {
+            pattern: Some(p),
+            ..
+        } if *p == checker
+    )));
 }

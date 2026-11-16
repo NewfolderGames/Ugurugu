@@ -304,7 +304,7 @@ impl Session {
         behind: bool,
     ) -> Result<Outcome, FillError> {
         let antialias = tools.fill.antialias && !self.pixel_mode();
-        let (layer, color) = (self.layer, tools.color);
+        let (layer, color, pattern) = (self.layer, tools.color, tools.pattern);
         let outcome = self.history_mut()?.group("Fill", |group| {
             let coverage = selecting::stored_mask(group, coverage)?;
             let clip = match &clip {
@@ -312,7 +312,9 @@ impl Session {
                 None => None,
             };
             group.apply(|document| {
-                command::fill(document, layer, coverage, color, antialias, clip, behind)
+                command::fill(
+                    document, layer, coverage, color, antialias, clip, behind, pattern,
+                )
             })
         })?;
         if let Outcome::Committed(_) = outcome {

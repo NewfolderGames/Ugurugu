@@ -516,7 +516,7 @@ impl Session {
                 let coverage = selecting::stored_mask(group, area)?;
                 group.apply(|document| {
                     command::fill(
-                        document, live.layer, coverage, color, antialias, clip, false,
+                        document, live.layer, coverage, color, antialias, clip, false, None,
                     )
                 })?;
                 match stroke {

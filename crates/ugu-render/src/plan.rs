@@ -23,6 +23,7 @@ use ugu_core::ops::{Affine, Blend, Op, Wobble};
 use ugu_core::store::Store;
 
 use crate::document::Purpose;
+use crate::filter::FilterSpec;
 use crate::transform::Moved;
 
 /// How a layer's or group's surface goes over what is below it.
@@ -55,6 +56,8 @@ pub enum Step {
     End(LayerId, Composite),
     /// Puts a paint layer's surface over the current one.
     Paint(LayerId, Composite),
+    /// Applies a filter layer pass over the current surface.
+    Filter(LayerId, FilterSpec),
 }
 
 /// Which layers a tool that reads the frame sees.
@@ -187,6 +190,7 @@ impl RenderPlan {
                     Step::Begin(id) => Step::Begin(*id),
                     Step::End(id, composite) => Step::End(*id, scale(composite)),
                     Step::Paint(id, composite) => Step::Paint(*id, scale(composite)),
+                    Step::Filter(id, spec) => Step::Filter(*id, spec.scaled(shrink)),
                 })
                 .collect(),
             ..self.clone()
@@ -223,14 +227,15 @@ impl RenderPlan {
     }
 
     fn shown(&self, layer: &Layer, references: bool) -> bool {
-        let (opacity, paint) = match &layer.kind {
+        let (opacity, paint_or_filter) = match &layer.kind {
             LayerKind::Paint(paint) => (paint.opacity, true),
             LayerKind::Group(group) => (group.opacity, false),
+            LayerKind::Filter(filter) => (filter.opacity, true),
         };
         layer.visible
             && opacity > 0.0
             && !(self.purpose == Purpose::Export && layer.reference)
-            && !(references && paint && !layer.reference)
+            && !(references && paint_or_filter && !layer.reference)
     }
 
     /// Adds `layers`, held by groups that move them by `outer`.
@@ -246,6 +251,7 @@ impl RenderPlan {
             let (blend, opacity, clipped) = match &layer.kind {
                 LayerKind::Paint(paint) => (paint.blend, paint.opacity, paint.clip_to_below),
                 LayerKind::Group(group) => (group.blend, group.opacity, group.clip_to_below),
+                LayerKind::Filter(filter) => (filter.blend, filter.opacity, filter.clip_to_below),
             };
             if !self.shown(layer, references) {
                 if !clipped {
@@ -306,6 +312,12 @@ impl RenderPlan {
                 self.add(&shown, document, references, moved);
                 self.steps.push(Step::End(layer.id, composite));
             }
+            LayerKind::Filter(filter) => {
+                self.steps.push(Step::Filter(
+                    layer.id,
+                    FilterSpec::new(composite, filter.kind.clone()),
+                ));
+            }
         }
     }
 }
@@ -316,6 +328,7 @@ fn collect_paint(layers: &[Layer], out: &mut Vec<LayerId>) {
         match &layer.kind {
             LayerKind::Paint(_) => out.push(layer.id),
             LayerKind::Group(group) => collect_paint(&group.children, out),
+            LayerKind::Filter(_) => {}
         }
     }
 }
@@ -388,6 +401,7 @@ mod tests {
         match &mut layer.kind {
             LayerKind::Paint(paint) => paint.clip_to_below = true,
             LayerKind::Group(group) => group.clip_to_below = true,
+            LayerKind::Filter(filter) => filter.clip_to_below = true,
         }
         layer
     }
@@ -510,6 +524,7 @@ mod tests {
                     ..Brush::default()
                 },
                 seed: 1,
+                pattern: None,
             },
         );
         Op::Paint {
@@ -559,7 +574,7 @@ mod tests {
     }
 
     fn keyed(mut layer: Layer, x: f64) -> Layer {
-        layer.keys_mut().set(ugu_core::keys::Key {
+        layer.keys_mut().unwrap().set(ugu_core::keys::Key {
             frame: 0,
             pose: ugu_core::keys::Pose {
                 offset: [x, 0.0],
@@ -581,7 +596,7 @@ mod tests {
                     assert!(composite.moved.is_none(), "groups pass their moves on");
                     None
                 }
-                Step::Begin(_) => None,
+                Step::Begin(_) | Step::Filter(_, _) => None,
             })
             .collect()
     }
@@ -593,7 +608,7 @@ mod tests {
             paint.opacity = 0.8;
         }
         for (frame, opacity) in [(0, 1.0), (4, 0.5)] {
-            faded.keys_mut().set(ugu_core::keys::Key {
+            faded.keys_mut().unwrap().set(ugu_core::keys::Key {
                 frame,
                 pose: ugu_core::keys::Pose {
                     opacity,

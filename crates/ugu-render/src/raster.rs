@@ -106,6 +106,7 @@ mod tests {
                         ..Brush::default()
                     },
                     seed: u64::from(index),
+                    pattern: None,
                 },
             );
             let stroke = StrokeId(index);

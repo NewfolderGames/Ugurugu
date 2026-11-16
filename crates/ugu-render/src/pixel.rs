@@ -452,6 +452,7 @@ mod tests {
             width,
             brush: brush::find("pixel-pencil").unwrap().brush,
             seed: 7,
+            pattern: None,
         }
     }
 

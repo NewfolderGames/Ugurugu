@@ -15,6 +15,7 @@ use std::sync::Arc;
 use ugu_core::document::{Document, LayerId, LayerKind};
 use ugu_core::history::LayerRevisions;
 use ugu_core::ops::{Outline, Wobble};
+use ugu_core::pattern::Pattern;
 use ugu_core::store::{BrushEngine, Mask, Stroke};
 use vello_common::geometry::RectU16;
 use vello_common::strip::{StripFillSegment, visit_strip_fill_segments};
@@ -28,6 +29,7 @@ use vello_cpu::{Pixmap, RasterizerSettings, RenderContext, RenderSettings, Resou
 use crate::composite::{self, Overlay, Put, Source};
 use crate::dab::{self, Dab};
 use crate::document::{DocumentRenderer, Purpose, drawn_from, tiles_reached};
+use crate::gradient::{self, GradientDraw};
 use crate::live::LiveStroke;
 use crate::mask::Runs;
 use crate::outline::{Look, Scratch};
@@ -377,6 +379,7 @@ impl Split {
                         color: premultiplied(stroke_color(stroke, erase)),
                         erase,
                         clip,
+                        pattern: (!erase).then_some(stroke.pattern).flatten(),
                     });
                     *rect
                 })
@@ -470,6 +473,7 @@ impl Split {
         antialias: bool,
         color: [u8; 4],
         behind: bool,
+        pattern: Option<Pattern>,
     ) -> Option<PixelRect> {
         let (area, fringe) = Runs::fill(coverage, clip, antialias);
         let bounds = [area.bounds(), fringe.as_ref().and_then(Runs::bounds)]
@@ -498,32 +502,60 @@ impl Split {
         let color = premultiplied(color);
         surface.ensure(rect);
         for (y, line) in surface.rows_mut(rect) {
-            let y = y as i32;
+            let yi = y as i32;
             let [left, right] = [rect[0] as i32, rect[2] as i32];
-            let span = |&[from, to]: &[i32; 2]| {
-                (from.clamp(left, right) - left) as usize..(to.clamp(left, right) - left) as usize
-            };
-            for run in area.row(y) {
-                if behind {
-                    for target in &mut line[span(run)] {
-                        dest_over(target, color);
+            for run in area.row(yi) {
+                let from = run[0].clamp(left, right);
+                let to = run[1].clamp(left, right);
+                for x in from..to {
+                    if !pattern.is_none_or(|p| p.contains(x, yi)) {
+                        continue;
                     }
-                } else {
-                    line[span(run)].fill(color);
+                    let target = &mut line[(x - left) as usize];
+                    if behind {
+                        dest_over(target, color);
+                    } else {
+                        *target = color;
+                    }
                 }
             }
-            for run in fringe.iter().flat_map(|fringe| fringe.row(y)) {
-                for target in &mut line[span(run)] {
-                    dest_over(target, color);
+            for run in fringe.iter().flat_map(|fringe| fringe.row(yi)) {
+                let from = run[0].clamp(left, right);
+                let to = run[1].clamp(left, right);
+                for x in from..to {
+                    if pattern.is_none_or(|p| p.contains(x, yi)) {
+                        dest_over(&mut line[(x - left) as usize], color);
+                    }
                 }
             }
         }
         Some(rect)
     }
 
+    /// Stamps `draw` `src_over` onto the edited layer, inside `clip` when given.
+    pub fn stamp_gradient(
+        &mut self,
+        draw: &GradientDraw,
+        clip: Option<&Mask>,
+    ) -> Option<PixelRect> {
+        let Held::Tiles(surface) = &self.sources[self.edited?] else {
+            unreachable!("a paint layer's pixels are tiles");
+        };
+        let bounds = draw.bounds(clip, surface.size())?;
+        self.reaches(bounds.map(f64::from));
+        let Held::Tiles(surface) = &mut self.sources[self.edited?] else {
+            unreachable!("a paint layer's pixels are tiles");
+        };
+        let surface = Arc::make_mut(surface);
+        gradient::stamp_gradient(surface, draw, clip)
+    }
+
     /// The pixels of the shown image that a change to the edited layer
     /// within `rect` can reach, in a canvas of `size`.
     pub fn shown(&self, rect: PixelRect, size: [u32; 2]) -> Option<PixelRect> {
+        if has_whole_plane_filter_after(&self.puts, self.edited) {
+            return Some([0, 0, size[0], size[1]]);
+        }
         match &self.moved {
             Some(moved) => moved.reach(rect, size),
             None => Some(rect),
@@ -547,8 +579,28 @@ impl Split {
 fn line_of(document: &Document, layer: LayerId) -> Option<Outline> {
     match &document.layer(layer)?.kind {
         LayerKind::Paint(paint) => paint.outline,
-        LayerKind::Group(_) => None,
+        LayerKind::Group(_) | LayerKind::Filter(_) => None,
     }
+}
+
+fn has_whole_plane_filter_after(puts: &[Put], edited: Option<usize>) -> bool {
+    let Some(edited) = edited else {
+        return false;
+    };
+    let mut seen_sources = 0usize;
+    let mut after_edited = false;
+    for put in puts {
+        if after_edited && matches!(put, Put::Filter(pass) if pass.is_whole_plane()) {
+            return true;
+        }
+        if matches!(put, Put::Over(_) | Put::Backdrop | Put::Base(_)) {
+            if seen_sources == edited {
+                after_edited = true;
+            }
+            seen_sources += 1;
+        }
+    }
+    false
 }
 
 impl DocumentRenderer {
@@ -929,6 +981,7 @@ impl Stamp {
         );
         surface.ensure(rect);
         let buffer = &self.buffer;
+        let pattern = (!erase).then_some(stroke.pattern).flatten();
         let lay = |rows: &mut [(u32, &mut [[u8; 4]])]| {
             for (y, line) in rows {
                 let from = (*y - top) as usize * width;
@@ -939,7 +992,8 @@ impl Stamp {
                     }
                     if erase {
                         dest_out(target, source[3]);
-                    } else {
+                    } else if pattern.is_none_or(|p| p.contains(left as i32 + x as i32, *y as i32))
+                    {
                         src_over(target, source);
                     }
                 }
@@ -997,6 +1051,7 @@ fn lay_line(
         color: premultiplied(stroke_color(stroke, erase)),
         erase,
         clip,
+        pattern: (!erase).then_some(stroke.pattern).flatten(),
     };
     lay_lines(surface, std::slice::from_ref(&line), 1);
 }
@@ -1009,6 +1064,7 @@ struct Laid<'a> {
     color: [u8; 4],
     erase: bool,
     clip: Option<&'a Mask>,
+    pattern: Option<Pattern>,
 }
 
 impl Laid<'_> {
@@ -1029,6 +1085,9 @@ impl Laid<'_> {
         for x in start..end {
             let cover = source[(row + (x - from_x) as usize) * 4 + 3];
             if cover == 0 || !inside(self.clip, x as usize, y as usize) {
+                continue;
+            }
+            if !self.erase && !self.pattern.is_none_or(|p| p.contains(x as i32, y as i32)) {
                 continue;
             }
             let target = &mut line[(x - left) as usize];
@@ -1092,6 +1151,7 @@ fn apply_pixels(
     let cells = pixel::cells(&stroke.points, pen, frame);
     let rect = pixel_rect(&cells, surface.size())?;
     let color = premultiplied(stroke_color(stroke, erase));
+    let pattern = (!erase).then_some(stroke.pattern).flatten();
     surface.ensure(rect);
     let runs = cells.runs();
     let mut next = 0;
@@ -1106,6 +1166,9 @@ fn apply_pixels(
             let to = to.min(rect[2] as i32);
             for x in from..to {
                 if !inside(clip, x as usize, y as usize) {
+                    continue;
+                }
+                if !erase && !pattern.is_none_or(|p| p.contains(x, y)) {
                     continue;
                 }
                 let target = &mut line[(x - rect[0] as i32) as usize];
@@ -1192,6 +1255,7 @@ mod tests {
                 ..Brush::default()
             },
             seed,
+            pattern: None,
         }
     }
 
@@ -1267,7 +1331,7 @@ mod tests {
                                 motion,
                             });
                         }
-                        LayerKind::Group(_) => unreachable!("a paint layer"),
+                        LayerKind::Group(_) | LayerKind::Filter(_) => unreachable!("a paint layer"),
                     })
                     .unwrap()
                 })
@@ -1302,6 +1366,7 @@ mod tests {
                     antialias: true,
                     clip: Some(mask),
                     behind: false,
+                    pattern: None,
                 };
                 vec![
                     Change::InsertMask(mask, selection),
@@ -1733,6 +1798,7 @@ mod tests {
                 ..ugu_core::brush::BRUSHES[0].brush
             },
             seed,
+            pattern: None,
         }
     }
 
@@ -1856,6 +1922,7 @@ mod tests {
                             antialias,
                             color,
                             behind,
+                            None,
                         )
                         .unwrap();
                     assert!(rect[2] > rect[0]);
@@ -1877,6 +1944,7 @@ mod tests {
                                     antialias,
                                     clip,
                                     behind,
+                                    None,
                                 )
                             })
                         })
@@ -1928,7 +1996,7 @@ mod tests {
             .unwrap();
             ugu_core::edit::commit(&mut document, changes).unwrap();
             let color = Rgba8([30 + 20 * i, 130 - 5 * i, 57 + 14 * i, 100 + 11 * i]);
-            let changes = command::fill(&document, id, mask, color, true, None, false);
+            let changes = command::fill(&document, id, mask, color, true, None, false, None);
             ugu_core::edit::commit(&mut document, changes).unwrap();
         }
         document
@@ -2244,9 +2312,9 @@ mod tests {
         history
             .edit("Keys", |document| {
                 command::update_layer(document, id, |layer| {
-                    layer.keys_mut().pivot = pivot;
+                    layer.keys_mut().unwrap().pivot = pivot;
                     for key in keys {
-                        layer.keys_mut().set(*key);
+                        layer.keys_mut().unwrap().set(*key);
                     }
                 })
                 .unwrap()
@@ -2744,6 +2812,7 @@ mod tests {
                     ..Brush::default()
                 },
                 seed: index as u64,
+                pattern: None,
             };
             history
                 .edit("Draw", |document| {
@@ -2779,5 +2848,343 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn assert_full_streamed_split_identical(document: &Document, edited: LayerId, label: &str) {
+        let mut full_r = DocumentRenderer::new(4);
+        let mut full = canvas(document);
+        full_r.render(document, 0, Purpose::Display, &mut full);
+
+        let mut streamed_r = DocumentRenderer::new(4);
+        streamed_r.set_surface_budget(0);
+        let mut streamed = canvas(document);
+        streamed_r.render(document, 0, Purpose::Display, &mut streamed);
+        assert_eq!(
+            full.data_as_u8_slice(),
+            streamed.data_as_u8_slice(),
+            "{label}: full vs streamed differ"
+        );
+
+        for budget in [usize::MAX, 0] {
+            let mut split_r = DocumentRenderer::new(4);
+            split_r.set_surface_budget(budget);
+            let mut split_out = canvas(document);
+            let split = split_r
+                .split(document, edited, 0, None, &mut split_out)
+                .unwrap();
+            assert_eq!(
+                full.data_as_u8_slice(),
+                split_out.data_as_u8_slice(),
+                "{label} (budget {budget}): full vs split differ"
+            );
+            let mut recomp = canvas(document);
+            composite(&split, &[], whole(document), &mut recomp);
+            assert_eq!(
+                full.data_as_u8_slice(),
+                recomp.data_as_u8_slice(),
+                "{label} (budget {budget}): full vs recomposite differ"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_layers_match_across_full_streamed_and_split() {
+        use ugu_core::dither::{Dither, Screentone, ToneShape};
+        use ugu_core::gradient::{Gradient, GradientStop, QuantizeMode};
+        use ugu_core::ops::{FilterKind, FilterLayer};
+
+        let grad = Gradient::new(vec![
+            GradientStop {
+                position: 0.0,
+                color: Rgba8([16, 32, 64, 255]),
+            },
+            GradientStop {
+                position: 0.5,
+                color: Rgba8([240, 120, 40, 200]),
+            },
+            GradientStop {
+                position: 1.0,
+                color: Rgba8([255, 255, 240, 255]),
+            },
+        ]);
+        for (dither, clipped, in_group) in [
+            (Dither::Bayer4, false, false),
+            (Dither::FloydSteinberg, false, false),
+            (Dither::Atkinson, true, true),
+        ] {
+            let mut doc = Document::new([48, 32]);
+            let base_id = doc.layers[0].id;
+            let s1 = stroke([4.0, 6.0], [44.0, 26.0], [210, 80, 50, 255], 11);
+            let changes = command::draw(&doc, base_id, s1, false, None);
+            ugu_core::edit::commit(&mut doc, changes).unwrap();
+            let (top_id, changes) = command::add_paint_layer(&doc, None, 1, "Top".into());
+            ugu_core::edit::commit(&mut doc, changes).unwrap();
+            let s2 = stroke([12.0, 22.0], [40.0, 8.0], [40, 190, 230, 255], 22);
+            let changes = command::draw(&doc, top_id, s2, false, None);
+            ugu_core::edit::commit(&mut doc, changes).unwrap();
+            let (filter_id, changes) = command::add_filter_layer(
+                &doc,
+                None,
+                2,
+                "Map".into(),
+                FilterLayer {
+                    opacity: 0.85,
+                    blend: ugu_core::ops::Blend::Normal,
+                    clip_to_below: clipped,
+                    kind: FilterKind::GradientMap {
+                        gradient: grad.clone(),
+                        dither,
+                        quantize: QuantizeMode::Overall(4),
+                    },
+                },
+            );
+            ugu_core::edit::commit(&mut doc, changes).unwrap();
+            if in_group {
+                let (_, changes) = command::wrap_in_group(&doc, filter_id, "G".into()).unwrap();
+                ugu_core::edit::commit(&mut doc, changes).unwrap();
+                let group_id = doc.layers.last().unwrap().id;
+                let changes = command::move_to_group(&doc, top_id, Some(group_id)).unwrap();
+                ugu_core::edit::commit(&mut doc, changes).unwrap();
+                let (top_pos, filter_pos) = (
+                    doc.position(top_id).unwrap().1,
+                    doc.position(filter_id).unwrap().1,
+                );
+                if filter_pos < top_pos {
+                    let changes = command::move_layer(&doc, filter_id, Some(group_id), 1).unwrap();
+                    ugu_core::edit::commit(&mut doc, changes).unwrap();
+                }
+            }
+            assert_full_streamed_split_identical(&doc, base_id, &format!("{dither:?}/{clipped}"));
+            if dither.is_error_diffusion() && !in_group {
+                let mut r = DocumentRenderer::new(0);
+                let mut pix = canvas(&doc);
+                let sp = r.split(&doc, base_id, 0, None, &mut pix).unwrap();
+                assert_eq!(sp.shown([2, 2, 4, 4], doc.canvas), Some(whole(&doc)));
+            }
+        }
+
+        // Screentone rotated & semi-transparent background
+        let mut tone_doc = Document::new([48, 32]);
+        let base_id = tone_doc.layers[0].id;
+        let s = stroke([4.0, 4.0], [44.0, 28.0], [180, 140, 100, 255], 33);
+        let ch = command::draw(&tone_doc, base_id, s, false, None);
+        ugu_core::edit::commit(&mut tone_doc, ch).unwrap();
+        let (_, ch) = command::add_filter_layer(
+            &tone_doc,
+            None,
+            1,
+            "Tone".into(),
+            FilterLayer {
+                opacity: 0.9,
+                blend: ugu_core::ops::Blend::Multiply,
+                clip_to_below: false,
+                kind: FilterKind::Screentone(Screentone {
+                    shape: ToneShape::Dot,
+                    size: 6.0,
+                    angle: 30.0,
+                    dot_color: Rgba8([20, 20, 40, 255]),
+                    background: None,
+                }),
+            },
+        );
+        ugu_core::edit::commit(&mut tone_doc, ch).unwrap();
+        assert_full_streamed_split_identical(&tone_doc, base_id, "Screentone");
+    }
+
+    #[test]
+    fn gradient_op_and_patterned_strokes_and_fills_match_full_streamed_and_split() {
+        use ugu_core::dither::Dither;
+        use ugu_core::gradient::{Gradient, GradientShape, GradientStop, QuantizeMode};
+        use ugu_core::pattern;
+
+        let checker = pattern::find("checker-50").unwrap().pattern;
+        let grad = Gradient::new(vec![
+            GradientStop {
+                position: 0.0,
+                color: Rgba8([255, 0, 0, 255]),
+            },
+            GradientStop {
+                position: 1.0,
+                color: Rgba8([0, 0, 255, 128]),
+            },
+        ]);
+
+        // Op::Gradient stamp vs DocumentRenderer
+        for (shape, dither) in [
+            (GradientShape::Linear, Dither::Bayer4),
+            (GradientShape::Radial, Dither::FloydSteinberg),
+        ] {
+            let mut doc = Document::new([48, 32]);
+            let layer_id = doc.layers[0].id;
+            let mut r = DocumentRenderer::new(0);
+            let mut split_buf = canvas(&doc);
+            let mut split = r.split(&doc, layer_id, 0, None, &mut split_buf).unwrap();
+            let draw = GradientDraw {
+                gradient: grad.clone(),
+                shape,
+                from: [4.0, 4.0],
+                to: [44.0, 28.0],
+                dither,
+                quantize: QuantizeMode::Overall(4),
+                opacity: 0.9,
+            };
+            split.stamp_gradient(&draw, None);
+            composite(&split, &[], whole(&doc), &mut split_buf);
+            let ch = command::gradient(
+                &doc,
+                layer_id,
+                grad.clone(),
+                shape,
+                [4.0, 4.0],
+                [44.0, 28.0],
+                dither,
+                QuantizeMode::Overall(4),
+                0.9,
+                None,
+            );
+            ugu_core::edit::commit(&mut doc, ch).unwrap();
+            // A subsequent stroke after Op::Gradient verifies the transform is restored.
+            let after_stroke = stroke([6.0, 20.0], [42.0, 10.0], [20, 220, 60, 255], 71);
+            let mut stamp = Stamp::default();
+            let mut helpers = Vec::new();
+            let wobble = doc.wobble;
+            let frames = doc.frames;
+            split.stamp_strokes(
+                &mut stamp,
+                &mut helpers,
+                &[(&after_stroke, false, None)],
+                wobble,
+                frames,
+                1,
+            );
+            composite(&split, &[], whole(&doc), &mut split_buf);
+            let ch = command::draw(&doc, layer_id, after_stroke, false, None);
+            ugu_core::edit::commit(&mut doc, ch).unwrap();
+            assert_full_streamed_split_identical(
+                &doc,
+                layer_id,
+                &format!("grad {shape:?}/{dither:?}"),
+            );
+            let most = max_difference(&split_buf, &full(&doc, 0));
+            assert!(
+                most <= 1,
+                "grad {shape:?}/{dither:?}: stamped vs full differs by {most}"
+            );
+        }
+
+        // Patterned strokes (Line aliased/antialiased, Pixel, Spray) + Fill (front & behind)
+        let mut pat_doc = Document::new([48, 32]);
+        let layer_id = pat_doc.layers[0].id;
+        let base_fill_mask = ugu_core::store::Mask {
+            bounds: [0, 0, 48, 32],
+            bits: vec![0xff; 6 * 32].into(),
+        };
+        let mask_id = ugu_core::ops::MaskId(0);
+        ugu_core::edit::commit(
+            &mut pat_doc,
+            vec![Change::InsertMask(mask_id, base_fill_mask)],
+        )
+        .unwrap();
+        let ch = command::fill(
+            &pat_doc,
+            layer_id,
+            mask_id,
+            Rgba8([200, 40, 40, 255]),
+            false,
+            None,
+            false,
+            None,
+        );
+        ugu_core::edit::commit(&mut pat_doc, ch).unwrap();
+
+        let mut split_r = DocumentRenderer::new(0);
+        let mut split_out = canvas(&pat_doc);
+        let mut split = split_r
+            .split(&pat_doc, layer_id, 0, None, &mut split_out)
+            .unwrap();
+        let mut stamp = Stamp::default();
+        let mut helpers = Vec::new();
+        let wobble = pat_doc.wobble;
+        let frames = pat_doc.frames;
+
+        for (engine, antialias, color, from, to) in [
+            (
+                BrushEngine::Line,
+                false,
+                [20, 200, 40, 255],
+                [4.0, 4.0],
+                [44.0, 12.0],
+            ),
+            (
+                BrushEngine::Line,
+                true,
+                [20, 80, 220, 200],
+                [4.0, 16.0],
+                [44.0, 26.0],
+            ),
+            (
+                BrushEngine::Pixel,
+                false,
+                [240, 200, 20, 255],
+                [6.0, 8.0],
+                [40.0, 8.0],
+            ),
+            (
+                BrushEngine::Spray,
+                true,
+                [180, 40, 220, 255],
+                [10.0, 24.0],
+                [36.0, 24.0],
+            ),
+        ] {
+            let mut s = stroke(from, to, color, 55);
+            s.brush.engine = engine;
+            s.brush.antialias = antialias;
+            s.pattern = Some(checker);
+            split.stamp_strokes(
+                &mut stamp,
+                &mut helpers,
+                &[(&s, false, None)],
+                wobble,
+                frames,
+                1,
+            );
+            let ch = command::draw(&pat_doc, layer_id, s, false, None);
+            ugu_core::edit::commit(&mut pat_doc, ch).unwrap();
+        }
+        let sub_mask = ugu_core::selection::Selection::of_shape(
+            &ugu_core::selection::Shape::Rectangle([8.0, 8.0], [24.0, 24.0]),
+            pat_doc.canvas,
+        )
+        .unwrap();
+        split.stamp_fill(
+            sub_mask.mask(),
+            None,
+            false,
+            [255, 255, 255, 255],
+            false,
+            Some(checker),
+        );
+        let sub_id = ugu_core::ops::MaskId(1);
+        ugu_core::edit::commit(
+            &mut pat_doc,
+            vec![Change::InsertMask(sub_id, sub_mask.mask().clone())],
+        )
+        .unwrap();
+        let ch = command::fill(
+            &pat_doc,
+            layer_id,
+            sub_id,
+            Rgba8([255, 255, 255, 255]),
+            false,
+            None,
+            false,
+            Some(checker),
+        );
+        ugu_core::edit::commit(&mut pat_doc, ch).unwrap();
+        composite(&split, &[], whole(&pat_doc), &mut split_out);
+        assert_full_streamed_split_identical(&pat_doc, layer_id, "Patterned strokes and fill");
+        let most = max_difference(&split_out, &full(&pat_doc, 0));
+        assert!(most <= 1, "patterned stamped vs full differs by {most}");
     }
 }

@@ -105,7 +105,9 @@ impl Session {
         self.posing = None;
         let cycle = self.cycle();
         self.update_layer(id, "Move layer on this frame", |layer| {
-            let keys = layer.keys_mut();
+            let Some(keys) = layer.keys_mut() else {
+                return;
+            };
             if keys.is_empty() {
                 keys.pivot = pivot;
             }
@@ -133,7 +135,9 @@ impl Session {
         self.posing = None;
         let cycle = self.cycle();
         self.update_layer(id, "Paste key", |layer| {
-            let keys = layer.keys_mut();
+            let Some(keys) = layer.keys_mut() else {
+                return;
+            };
             if keys.is_empty() {
                 keys.pivot = pivot;
             }
@@ -150,7 +154,9 @@ impl Session {
         let cycle = self.cycle();
         if self.key_here(id).is_some() {
             return self.update_layer(id, "Remove key", |layer| {
-                layer.keys_mut().remove(cycle);
+                if let Some(keys) = layer.keys_mut() {
+                    keys.remove(cycle);
+                }
             });
         }
         let pose = self.pose(id);
@@ -160,7 +166,9 @@ impl Session {
     /// Takes away the key of `id` on `frame`.
     pub fn remove_key(&mut self, id: LayerId, frame: u32) -> Result<Outcome, EditError> {
         self.update_layer(id, "Remove key", |layer| {
-            layer.keys_mut().remove(frame);
+            if let Some(keys) = layer.keys_mut() {
+                keys.remove(frame);
+            }
         })
     }
 
@@ -170,7 +178,9 @@ impl Session {
             return Ok(Outcome::NoChange);
         }
         self.update_layer(id, "Move key", |layer| {
-            let keys = layer.keys_mut();
+            let Some(keys) = layer.keys_mut() else {
+                return;
+            };
             if let Some(mut key) = keys.key(from).copied() {
                 keys.remove(from);
                 key.frame = to;
@@ -182,7 +192,9 @@ impl Session {
     /// How the key of `id` on `frame` eases on to the next.
     pub fn set_ease(&mut self, id: LayerId, frame: u32, ease: Ease) -> Result<Outcome, EditError> {
         self.update_layer(id, "Key easing", |layer| {
-            let keys = layer.keys_mut();
+            let Some(keys) = layer.keys_mut() else {
+                return;
+            };
             if let Some(mut key) = keys.key(frame).copied() {
                 key.ease = ease;
                 keys.set(key);
@@ -197,7 +209,9 @@ impl Session {
     /// apps.
     pub fn set_pivot(&mut self, id: LayerId, pivot: [f64; 2]) -> Result<Outcome, EditError> {
         self.update_layer(id, "Move pivot", |layer| {
-            let keys = layer.keys_mut();
+            let Some(keys) = layer.keys_mut() else {
+                return;
+            };
             let old = keys.pivot;
             keys.pivot = pivot;
             // A move about another pivot moves by as much more as the
@@ -244,8 +258,10 @@ impl Session {
         };
         let mut document = self.document().clone();
         let cycle = self.cycle();
-        if let Some(layer) = find_mut(&mut document.layers, posing.layer) {
-            layer.keys_mut().set(Key {
+        if let Some(layer) = find_mut(&mut document.layers, posing.layer)
+            && let Some(keys) = layer.keys_mut()
+        {
+            keys.set(Key {
                 frame: cycle,
                 pose: posing.pose,
                 ease: Ease::Linear,
@@ -415,7 +431,7 @@ fn find_mut(
         }
         match &mut layer.kind {
             LayerKind::Group(group) => find_mut(&mut group.children, id),
-            LayerKind::Paint(_) => None,
+            LayerKind::Paint(_) | LayerKind::Filter(_) => None,
         }
     })
 }

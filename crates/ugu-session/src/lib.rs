@@ -13,6 +13,7 @@
 mod animating;
 mod clipboard;
 mod filling;
+mod gradienting;
 mod placing;
 mod restyling;
 mod selecting;
@@ -30,11 +31,12 @@ use ugu_core::command;
 use ugu_core::document::{Document, Layer, LayerId, LayerKind, limits};
 use ugu_core::edit::{EditError, Outcome};
 use ugu_core::history::{History, LayerRevisions, StateId};
-use ugu_core::ops::{Affine, Rgba8, Sampling, Wobble};
+use ugu_core::ops::{Affine, FilterKind, FilterLayer, Rgba8, Sampling, Wobble};
 use ugu_core::store::{self, Brush, BrushEngine, Point, Stroke};
 
 pub use crate::animating::Posing;
 pub use crate::filling::{FillError, FillSettings, Reads};
+pub use crate::gradienting::{GradientSettings, LiveGradient};
 pub use crate::placing::{Placed, TextDrawing, TextSettings, TextStyle};
 pub use crate::selecting::{Lasso, ShapeKind};
 pub use crate::shaping::{Drag, Shape, ShapeFill, ShapePaint, ShapeSettings, outline};
@@ -54,6 +56,7 @@ pub enum Named {
     Group,
     AnimationFolder,
     Cel,
+    Filter,
 }
 
 /// Names an added layer, group, animation folder or cel by its number, in
@@ -67,6 +70,7 @@ pub fn english(named: Named, number: u32) -> String {
         Named::Group => "Group",
         Named::AnimationFolder => "Animation",
         Named::Cel => "Cel",
+        Named::Filter => "Filter",
     };
     format!("{word} {number}")
 }
@@ -78,6 +82,7 @@ pub enum Tool {
     Select,
     Wand,
     Fill,
+    Gradient,
     Text,
     Eyedropper,
     Shape,
@@ -264,6 +269,7 @@ pub struct Session {
     layer: LayerId,
     frame: i64,
     live: Option<LiveStroke>,
+    live_gradient: Option<LiveGradient>,
     pending: Option<Pending>,
     /// The text the text tool places.
     pub text_content: String,
@@ -308,6 +314,7 @@ impl Session {
             layer,
             frame: 0,
             live: None,
+            live_gradient: None,
             pending: None,
             text_content: String::new(),
             placed: None,
@@ -567,6 +574,9 @@ impl Session {
                 ..settings.preset.brush
             },
             seed: self.seeds.hash_one(self.strokes_started),
+            pattern: (tools.tool == Tool::Pen && !erase)
+                .then_some(tools.pattern)
+                .flatten(),
         };
         let position = clamp_position(into(to_layer, input.position));
         // The ruler is on the canvas as shown; the copies are found in the
@@ -714,9 +724,10 @@ impl Session {
         self.drop_live();
     }
 
-    /// Ends the stroke under way without it, and the cel added for it.
+    /// Ends the stroke or gradient under way without it, and the cel added for it.
     pub(crate) fn drop_live(&mut self) {
         self.live = None;
+        self.live_gradient = None;
         self.drop_cel();
     }
 
@@ -724,6 +735,7 @@ impl Session {
     /// change.
     pub fn undo(&mut self) -> Result<bool, EditError> {
         self.live = None;
+        self.live_gradient = None;
         self.made_cel = None;
         self.lasso = None;
         if self.cancel_transform() || self.cancel_text() {
@@ -771,6 +783,39 @@ impl Session {
         Ok(outcome)
     }
 
+    /// Adds a filter layer above the current layer and makes it current.
+    pub fn add_filter_layer(&mut self, kind: FilterKind) -> Result<Outcome, EditError> {
+        self.settle()?;
+        let (parent, index) = self
+            .document()
+            .position(self.layer)
+            .map_or((None, self.document().layers.len()), |(parent, index)| {
+                (parent, index + 1)
+            });
+        let name = self.name_of(Named::Filter, command::next_layer_id(self.document()).0);
+        let mut added = None;
+        let outcome = self.history_mut()?.edit("Add filter layer", |document| {
+            let filter = FilterLayer {
+                kind: kind.clone(),
+                ..FilterLayer::default()
+            };
+            let (id, changes) = command::add_filter_layer(document, parent, index, name, filter);
+            added = Some(id);
+            changes
+        })?;
+        if let (Outcome::Committed(_), Some(id)) = (&outcome, added) {
+            self.layer = id;
+        }
+        Ok(outcome)
+    }
+
+    pub fn is_filter_layer(&self, id: LayerId) -> bool {
+        matches!(
+            self.document().layer(id).map(|layer| &layer.kind),
+            Some(LayerKind::Filter(_))
+        )
+    }
+
     pub fn can_remove_layer(&self) -> bool {
         paint_outside(&self.document().layers, self.layer)
     }
@@ -792,7 +837,7 @@ impl Session {
     pub fn can_duplicate_layer(&self) -> bool {
         matches!(
             self.document().layer(self.layer).map(|layer| &layer.kind),
-            Some(LayerKind::Paint(_))
+            Some(LayerKind::Paint(_) | LayerKind::Filter(_))
         )
     }
 
@@ -1062,6 +1107,7 @@ fn paint_outside(layers: &[Layer], id: LayerId) -> bool {
             && match &layer.kind {
                 LayerKind::Paint(_) => true,
                 LayerKind::Group(group) => paint_outside(&group.children, id),
+                LayerKind::Filter(_) => false,
             }
     })
 }
@@ -1079,6 +1125,7 @@ fn top_paint_layer(layers: &[Layer]) -> Option<LayerId> {
     layers.iter().rev().find_map(|layer| match &layer.kind {
         LayerKind::Paint(_) => Some(layer.id),
         LayerKind::Group(group) => top_paint_layer(&group.children),
+        LayerKind::Filter(_) => None,
     })
 }
 

@@ -161,6 +161,7 @@ impl Session {
                 ..letter_brush(&style.pen.preset.brush)
             },
             seed: 0,
+            pattern: None,
         };
         let contours = &placed.outline.contours;
         // Laid out on screen, then taken into the layer's own pixels.
@@ -258,6 +259,7 @@ pub(crate) fn text_into(
                 drawing.antialias,
                 clip,
                 false,
+                None,
             )
         })?;
     }

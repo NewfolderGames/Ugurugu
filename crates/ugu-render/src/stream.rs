@@ -15,6 +15,7 @@ use vello_cpu::Pixmap;
 
 use crate::composite::{Kept, Put, Stream};
 use crate::document::{DocumentRenderer, scaled_size};
+use crate::filter::FilterPass;
 use crate::plan::{Composite, RenderPlan, Step};
 use crate::tile::{Pixel, TiledSurface};
 
@@ -38,12 +39,14 @@ impl From<Kept> for Held {
 enum Node {
     Paint(LayerId, Composite),
     Group(Composite, Vec<Node>),
+    Filter(Arc<FilterPass>),
 }
 
 impl Node {
     fn composite(&self) -> Composite {
         match self {
             Self::Paint(_, composite) | Self::Group(composite, _) => *composite,
+            Self::Filter(pass) => pass.composite,
         }
     }
 }
@@ -62,6 +65,10 @@ fn tree(steps: &[Step]) -> Vec<Node> {
                 .last_mut()
                 .expect("the document level")
                 .push(Node::Paint(*id, *composite)),
+            Step::Filter(_, spec) => levels
+                .last_mut()
+                .expect("the document level")
+                .push(Node::Filter(spec.pass())),
         }
     }
     levels.pop().expect("the document level")
@@ -78,6 +85,7 @@ fn path_to(nodes: &[Node], layer: LayerId) -> Option<Vec<usize>> {
                 rest.insert(0, index);
                 rest
             }),
+            Node::Filter(_) => None,
         })
 }
 
@@ -173,16 +181,22 @@ impl DocumentRenderer {
                 .iter()
                 .rposition(|node| !node.composite().clipped)
         {
-            let mut kept = self.alone(run, &siblings[base])?;
-            // The base is cut to where it is shown.
-            if let Some(moved) = siblings[base].composite().moved {
-                let size = scaled_size(run.document.canvas, run.shrink);
-                kept = Kept::Whole(crate::transform::whole(kept.source(), &moved, size));
+            if matches!(siblings[base], Node::Filter(_)) {
+                let whole = self.stream(run, &siblings[..=base], background)?;
+                program.puts.push(Put::Base(1.0));
+                program.sources.push(Held::Whole(Arc::new(whole)));
+            } else {
+                let mut kept = self.alone(run, &siblings[base])?;
+                // The base is cut to where it is shown.
+                if let Some(moved) = siblings[base].composite().moved {
+                    let size = scaled_size(run.document.canvas, run.shrink);
+                    kept = Kept::Whole(crate::transform::whole(kept.source(), &moved, size));
+                }
+                program
+                    .puts
+                    .push(Put::Base(siblings[base].composite().opacity));
+                program.sources.push(kept.into());
             }
-            program
-                .puts
-                .push(Put::Base(siblings[base].composite().opacity));
-            program.sources.push(kept.into());
         }
         match element {
             Node::Paint(id, composite) => {
@@ -196,6 +210,7 @@ impl DocumentRenderer {
                 self.reduce(run, children, &path[1..], None, program)?;
                 program.puts.push(Put::End(*composite));
             }
+            Node::Filter(_) => unreachable!("filter layers cannot be edited as paint layers"),
         }
         // What comes after, each on its own with what is clipped to it, and
         // laid over in turn as a full render lays it: put together ahead of
@@ -203,9 +218,13 @@ impl DocumentRenderer {
         let rest = &siblings[at + 1..];
         let mut index = self.each_clipped(run, rest, 0, program)?;
         while let Some(node) = rest.get(index) {
-            let kept = self.alone(run, node)?;
-            program.puts.push(Put::Over(node.composite()));
-            program.sources.push(kept.into());
+            if let Node::Filter(pass) = node {
+                program.puts.push(Put::Filter(pass.clone()));
+            } else {
+                let kept = self.alone(run, node)?;
+                program.puts.push(Put::Over(node.composite()));
+                program.sources.push(kept.into());
+            }
             index = self.each_clipped(run, rest, index + 1, program)?;
         }
         Some(())
@@ -221,9 +240,13 @@ impl DocumentRenderer {
         program: &mut Program,
     ) -> Option<usize> {
         while let Some(node) = nodes.get(index).filter(|node| node.composite().clipped) {
-            let kept = self.alone(run, node)?;
-            program.puts.push(Put::Over(node.composite()));
-            program.sources.push(kept.into());
+            if let Node::Filter(pass) = node {
+                program.puts.push(Put::Filter(pass.clone()));
+            } else {
+                let kept = self.alone(run, node)?;
+                program.puts.push(Put::Over(node.composite()));
+                program.sources.push(kept.into());
+            }
             index += 1;
         }
         Some(index)
@@ -234,6 +257,7 @@ impl DocumentRenderer {
         match node {
             Node::Paint(id, _) => self.layer_alone(run, *id).map(Kept::Tiles),
             Node::Group(_, children) => self.stream(run, children, None).map(Kept::Whole),
+            Node::Filter(_) => unreachable!("filter layers have no standalone surface"),
         }
     }
 
@@ -275,6 +299,7 @@ impl DocumentRenderer {
                         program(children, puts);
                         puts.push(Put::End(*composite));
                     }
+                    Node::Filter(pass) => puts.push(Put::Filter(pass.clone())),
                 }
             }
         }
@@ -297,6 +322,9 @@ impl DocumentRenderer {
                     stream.step(Put::Begin, None);
                     self.feed(run, children, stream)?;
                     stream.step(Put::End(*composite), None);
+                }
+                Node::Filter(pass) => {
+                    stream.step(Put::Filter(pass.clone()), None);
                 }
             }
         }

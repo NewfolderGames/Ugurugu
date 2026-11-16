@@ -161,6 +161,7 @@ impl Session {
     pub fn escape(&mut self) -> bool {
         // Nothing is pending by the time it deselects, so that cannot fail.
         self.cancel_selection()
+            || self.cancel_gradient()
             || self.cancel_transform()
             || self.cancel_text()
             || self.deselect() == Ok(true)

@@ -306,6 +306,7 @@ fn paint_ops<'a>(layers: &'a [Layer], out: &mut Vec<(&'a str, &'a Op)>) {
                 out.extend(paint.ops.iter().map(|op| (layer.name.as_str(), op)))
             }
             LayerKind::Group(group) => paint_ops(&group.children, out),
+            LayerKind::Filter(_) => {}
         }
     }
 }
@@ -316,6 +317,7 @@ fn tree(layers: &[Layer], depth: usize) {
         let (kind, operations) = match &layer.kind {
             LayerKind::Paint(paint) => ("paint", paint.ops.len()),
             LayerKind::Group(group) => ("group", group.children.len()),
+            LayerKind::Filter(_) => ("filter", 0),
         };
         println!(
             "{:indent$}{kind} \"{}\" {operations} {:?} {:.0}%{}{}{}",
@@ -344,6 +346,7 @@ fn count(layers: &[Layer], total: &mut usize, operations: &mut usize) {
         match &layer.kind {
             LayerKind::Paint(paint) => *operations += paint.ops.len(),
             LayerKind::Group(group) => count(&group.children, total, operations),
+            LayerKind::Filter(_) => {}
         }
     }
 }
@@ -466,7 +469,7 @@ fn onion(path: &Path, threads: u16) -> Result<(), String> {
         layers.iter().find_map(|layer| match &layer.kind {
             LayerKind::Group(group) if group.cels.is_some() => Some(layer.id),
             LayerKind::Group(group) => folder(&group.children),
-            LayerKind::Paint(_) => None,
+            LayerKind::Paint(_) | LayerKind::Filter(_) => None,
         })
     }
 
@@ -556,6 +559,7 @@ fn animate(from: &Path, to: &Path, keyed: usize, cels: u32) -> Result<(), String
             match &layer.kind {
                 LayerKind::Paint(_) => out.push(layer.id),
                 LayerKind::Group(group) => paint_ids(&group.children, out),
+                LayerKind::Filter(_) => {}
             }
         }
     }
@@ -568,7 +572,7 @@ fn animate(from: &Path, to: &Path, keyed: usize, cels: u32) -> Result<(), String
     let half = document.frames / 2;
     for id in ids.iter().take(keyed) {
         let changes = command::update_layer(&document, *id, |layer| {
-            let keys = layer.keys_mut();
+            let keys = layer.keys_mut().unwrap();
             keys.pivot = centre;
             keys.set(Key {
                 frame: 0,
@@ -719,6 +723,7 @@ fn fills(from: &Path, to: &Path) -> Result<(), String> {
                 antialias: true,
                 clip: Some(stripes),
                 behind: false,
+                pattern: None,
             },
         );
         paint.ops.push(Op::ClearSelection { mask: small });
@@ -798,6 +803,7 @@ fn top_paint(layers: &mut [Layer]) -> Option<&mut PaintLayer> {
         .find_map(|layer| match &mut layer.kind {
             LayerKind::Paint(paint) => Some(paint),
             LayerKind::Group(group) => top_paint(&mut group.children),
+            LayerKind::Filter(_) => None,
         })
 }
 
@@ -806,6 +812,7 @@ fn each_paint(layers: &mut [Layer], visit: &mut impl FnMut(&mut PaintLayer)) {
         match &mut layer.kind {
             LayerKind::Paint(paint) => visit(paint),
             LayerKind::Group(group) => each_paint(&mut group.children, visit),
+            LayerKind::Filter(_) => {}
         }
     }
 }
@@ -1410,6 +1417,7 @@ fn layers(path: &Path, threads: usize) -> Result<(), String> {
                     }
                 }
                 LayerKind::Group(group) => keep_only(&mut group.children, keep),
+                LayerKind::Filter(_) => {}
             }
         }
     }
@@ -1516,6 +1524,7 @@ fn most_operations(document: &mut Document) -> Option<LayerId> {
                     }
                 }
                 LayerKind::Group(group) => visit(&group.children, most),
+                LayerKind::Filter(_) => {}
             }
         }
     }
@@ -1533,6 +1542,7 @@ fn outline(from: &Path, to: &Path, which: &str, width: f32) -> Result<(), String
                     }
                 }
                 LayerKind::Group(group) => set(&mut group.children, only, line),
+                LayerKind::Filter(_) => {}
             }
         }
     }
@@ -1641,6 +1651,7 @@ fn live(
         width: stroke_width,
         brush,
         seed: 7,
+        pattern: None,
     };
     let frames = document.frames;
     let pen = Pen::new(&stroke, wobble, frames);
@@ -1977,6 +1988,7 @@ fn make_stroke(seed: u64, canvas: [u32; 2], shape: Shape) -> Stroke {
             ..Brush::default()
         },
         seed: stroke_seed,
+        pattern: None,
     }
 }
 

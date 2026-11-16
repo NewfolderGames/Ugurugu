@@ -79,7 +79,7 @@ impl Split {
         if let Some((coverage, antialias, color)) = fill {
             now = union(
                 now,
-                self.stamp_fill(coverage, clip, antialias, color, false),
+                self.stamp_fill(coverage, clip, antialias, color, false, None),
             );
         }
         for stroke in strokes {

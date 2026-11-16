@@ -9,12 +9,14 @@
 //! both in one scene. Multiply, Screen and Overlay are the W3C separable
 //! formulas on premultiplied values, rounded to the nearest level.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ugu_core::ops::Blend;
 use vello_cpu::Pixmap;
 
 use crate::compose::src_over;
+use crate::filter::FilterPass;
 use crate::plan::{Composite, RenderPlan, Step};
 use crate::raster::PixelRect;
 use crate::tile::TiledSurface;
@@ -70,7 +72,7 @@ pub fn blend(mode: Blend, target: &mut Pixel, source: Pixel) {
 /// One step of putting sources together. A program is made from a render
 /// plan by `program`, or by the editing split, which puts together ahead of
 /// time what does not depend on the layer being edited.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Put {
     /// Starts a group's transparent surface.
     Begin,
@@ -84,6 +86,8 @@ pub enum Put {
     /// Makes the next source, at this opacity, the base that clipped steps
     /// after it are cut to.
     Base(f32),
+    /// Applies a filter pass in place to the current surface.
+    Filter(Arc<FilterPass>),
 }
 
 /// The program that puts `plan`'s layers together, one source per layer.
@@ -94,6 +98,7 @@ pub fn program(plan: &RenderPlan) -> Vec<Put> {
             Step::Begin(_) => Put::Begin,
             Step::End(_, composite) => Put::End(*composite),
             Step::Paint(_, composite) => Put::Over(*composite),
+            Step::Filter(_, spec) => Put::Filter(spec.pass()),
         })
         .collect()
 }
@@ -189,6 +194,7 @@ fn bases_needed(puts: &[Put]) -> Vec<bool> {
                 composite
             }
             Put::Over(composite) => composite,
+            Put::Filter(pass) => &pass.composite,
             Put::Backdrop => continue,
             Put::Base(_) => {
                 *last_unclipped.last_mut().expect("the document level") = None;
@@ -258,6 +264,12 @@ fn run(
     stop: Option<&AtomicBool>,
     overlay: Option<&Overlay<'_>>,
 ) -> bool {
+    if puts
+        .iter()
+        .any(|put| matches!(put, Put::Filter(pass) if pass.is_whole_plane()))
+    {
+        return run_whole_plane(puts, background, sources, rect, out, threads, stop, overlay);
+    }
     let width = usize::from(out.width());
     let [left, top, right, bottom] = rect.map(|value| value as usize);
     if left >= right || top >= bottom {
@@ -422,9 +434,102 @@ impl Row<'_, '_> {
                     levels[depth].base = Some((row, opacity_level(*opacity)));
                     next += 1;
                 }
+                Put::Filter(pass) => {
+                    let level = &mut levels[depth];
+                    let clipped = pass.composite.clipped;
+                    let base = if clipped { level.base.take() } else { None };
+                    let base_slice = base.as_ref().map(|(row, op)| (row.as_slice(), *op));
+                    pass.apply_row(self.y, left, &mut level.row, base_slice);
+                    let keep = self.needed[index];
+                    level.base = if clipped {
+                        base
+                    } else {
+                        keep.then(|| (level.row.clone(), 255))
+                    };
+                }
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_whole_plane(
+    puts: &[Put],
+    background: Option<Pixel>,
+    sources: &[Source<'_>],
+    rect: PixelRect,
+    out: &mut Pixmap,
+    threads: usize,
+    stop: Option<&AtomicBool>,
+    overlay: Option<&Overlay<'_>>,
+) -> bool {
+    let [left, top, right, bottom] = rect.map(|value| value as usize);
+    if left >= right || top >= bottom {
+        return true;
+    }
+    let size = [u32::from(out.width()), u32::from(out.height())];
+    let mut stream = Stream::new(puts, size, background, threads);
+    let mut next = 0usize;
+    for put in puts {
+        if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+            return false;
+        }
+        match put {
+            Put::Begin => stream.step(Put::Begin, None),
+            Put::End(composite) => stream.step(Put::End(*composite), None),
+            Put::Filter(pass) => stream.step(Put::Filter(pass.clone()), None),
+            Put::Over(composite) => {
+                let src = sources[next];
+                let ov = overlay.filter(|ov| ov.source == next);
+                next += 1;
+                match ov {
+                    Some(ov) => {
+                        let pixmap = materialize_whole(src, size, Some(ov));
+                        stream.step(Put::Over(*composite), Some(Kept::Whole(pixmap)));
+                    }
+                    None => {
+                        let keep = stream.needed[stream.at];
+                        stream.at += 1;
+                        stream.over_borrowed(src, *composite, keep, || {
+                            Kept::Whole(materialize_whole(src, size, None))
+                        });
+                    }
+                }
+            }
+            Put::Backdrop | Put::Base(_) => {
+                let src = sources[next];
+                let ov = overlay.filter(|ov| ov.source == next);
+                next += 1;
+                let pixmap = materialize_whole(src, size, ov);
+                stream.step(put.clone(), Some(Kept::Whole(pixmap)));
+            }
+        }
+    }
+    let result = stream.finish();
+    let row_pixels = size[0] as usize;
+    let src_pixels = result.data_as_u8_slice().as_chunks::<4>().0;
+    let dst_pixels = out.data_as_u8_slice_mut().as_chunks_mut::<4>().0;
+    for y in top..bottom {
+        let span = y * row_pixels + left..y * row_pixels + right;
+        dst_pixels[span.clone()].copy_from_slice(&src_pixels[span]);
+    }
+    true
+}
+
+fn materialize_whole(source: Source<'_>, size: [u32; 2], overlay: Option<&Overlay<'_>>) -> Pixmap {
+    let mut pixmap = Pixmap::new(size[0] as u16, size[1] as u16);
+    let [w, h] = size.map(|v| v as usize);
+    let out = pixmap.data_as_u8_slice_mut().as_chunks_mut::<4>().0;
+    for y in 0..h {
+        let row = &mut out[y * w..(y + 1) * w];
+        source.parts_into(y, 0, row);
+        if let Some(ov) = overlay {
+            for (x, pixel) in row.iter_mut().enumerate() {
+                (ov.apply)(x, y, pixel);
+            }
+        }
+    }
+    pixmap
 }
 
 /// Puts `parts` of a surface (where each starts in the span, and its
@@ -559,6 +664,9 @@ impl Stream {
                     moved: None,
                 });
             }
+            Put::Filter(pass) => {
+                self.filter(pass.as_ref(), keep);
+            }
         }
     }
 
@@ -569,6 +677,34 @@ impl Stream {
     }
 
     fn over(&mut self, source: Kept, composite: Composite, keep: bool) {
+        self.over_pixels(source.source(), composite);
+        if !composite.clipped {
+            self.levels.last_mut().expect("the document level").1 = keep.then(|| KeptBase {
+                kept: source,
+                opacity: opacity_level(composite.opacity),
+                moved: composite.moved,
+            });
+        }
+    }
+
+    fn over_borrowed(
+        &mut self,
+        source: Source<'_>,
+        composite: Composite,
+        keep: bool,
+        make_kept: impl FnOnce() -> Kept,
+    ) {
+        self.over_pixels(source, composite);
+        if !composite.clipped {
+            self.levels.last_mut().expect("the document level").1 = keep.then(|| KeptBase {
+                kept: make_kept(),
+                opacity: opacity_level(composite.opacity),
+                moved: composite.moved,
+            });
+        }
+    }
+
+    fn over_pixels(&mut self, source: Source<'_>, composite: Composite) {
         let width = self.size[0] as usize;
         let threads = self.threads;
         let (target, base) = self.levels.last_mut().expect("the document level");
@@ -609,15 +745,13 @@ impl Stream {
                     };
                     match &composite.moved {
                         Some(moved) => {
-                            let row = transform::row(source.source(), moved, y, 0, width, None);
+                            let row = transform::row(source, moved, y, 0, width, None);
                             let whole = std::iter::once((0, row.as_slice()));
                             over(&mut level, whole, composite, false, width);
                         }
                         None => {
                             let mut parts = Vec::new();
-                            source
-                                .source()
-                                .parts(y, 0, width, |start, part| parts.push((start, part)));
+                            source.parts(y, 0, width, |start, part| parts.push((start, part)));
                             over(&mut level, parts.into_iter(), composite, false, width);
                         }
                     }
@@ -634,12 +768,81 @@ impl Stream {
                 }
             });
         }
-        drop(stripes);
-        if !composite.clipped {
+    }
+
+    fn filter(&mut self, pass: &FilterPass, keep: bool) {
+        let width = self.size[0] as usize;
+        let height = self.size[1] as usize;
+        let threads = self.threads;
+        let (target, base) = self.levels.last_mut().expect("the document level");
+        let clipped = pass.composite.clipped;
+        if clipped && base.is_none() {
+            return;
+        }
+        let base_snapshot = if clipped {
+            base.as_ref().map(|b| {
+                let src = b.kept.source();
+                let mut buf = Vec::with_capacity(width * height);
+                for y in 0..height {
+                    match &b.moved {
+                        Some(moved) => buf.extend(transform::row(src, moved, y, 0, width, None)),
+                        None => buf.extend(src.row(y, 0, width)),
+                    }
+                }
+                (buf, b.opacity)
+            })
+        } else {
+            None
+        };
+        if pass.is_whole_plane() {
+            let base_slice = base_snapshot
+                .as_ref()
+                .map(|(buf, op)| (buf.as_slice(), *op));
+            pass.apply_plane(target, base_slice);
+        } else {
+            let base_slice = base_snapshot
+                .as_ref()
+                .map(|(buf, op)| (buf.as_slice(), *op));
+            let stripes: Vec<std::sync::Mutex<(usize, &mut [Pixel])>> = target
+                .data_as_u8_slice_mut()
+                .as_chunks_mut::<4>()
+                .0
+                .chunks_mut(STRIPE * width)
+                .enumerate()
+                .map(|(index, rows)| std::sync::Mutex::new((index * STRIPE, rows)))
+                .collect();
+            let next = AtomicUsize::new(0);
+            let work = || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(stripe) = stripes.get(index) else {
+                        return;
+                    };
+                    let mut stripe = stripe.lock().expect("one thread per stripe");
+                    let (first, rows) = &mut *stripe;
+                    for (offset, line) in rows.chunks_mut(width).enumerate() {
+                        let y = *first + offset;
+                        let base_row =
+                            base_slice.map(|(buf, op)| (&buf[y * width..(y + 1) * width], op));
+                        pass.apply_row(y, 0, line, base_row);
+                    }
+                }
+            };
+            if threads <= 1 || stripes.len() < 2 {
+                work();
+            } else {
+                std::thread::scope(|scope| {
+                    for _ in 0..threads.min(stripes.len()) {
+                        scope.spawn(work);
+                    }
+                });
+            }
+        }
+        if !clipped {
             *base = keep.then(|| KeptBase {
-                kept: source,
-                opacity: opacity_level(composite.opacity),
-                moved: composite.moved,
+                kept: Kept::Whole(target.clone()),
+                opacity: 255,
+                moved: None,
             });
         }
     }

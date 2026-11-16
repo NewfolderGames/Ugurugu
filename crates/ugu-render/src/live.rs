@@ -16,6 +16,7 @@
 //! they too are walked once up to the samples that no longer move.
 
 use ugu_core::motion::{Breaks, Walk};
+use ugu_core::pattern::Pattern;
 use ugu_core::store::{BrushEngine, Mask, Point};
 use vello_cpu::Pixmap;
 use vello_cpu::color::{AlphaColor, Srgb};
@@ -80,6 +81,7 @@ pub struct LiveStroke {
     /// `coverage` is what the committed line covers (`line`), taken as it
     /// is rather than cut at the aliasing threshold.
     exact: bool,
+    pattern: Option<Pattern>,
 }
 
 /// A fill as `Split::stamp_fill` lays it: its pixels take the colour, and
@@ -89,6 +91,7 @@ struct Filled {
     fringe: Option<Runs>,
     /// Premultiplied.
     color: [u8; 4],
+    pattern: Option<Pattern>,
 }
 
 impl LiveStroke {
@@ -152,7 +155,14 @@ impl LiveStroke {
             fixed_shown: 0,
             filled: None,
             exact: false,
+            pattern: None,
         }
+    }
+
+    /// Masks painted pixels to a repeating 1-bit document-aligned `pattern`.
+    pub fn with_pattern(mut self, pattern: Option<Pattern>) -> Self {
+        self.pattern = pattern;
+        self
     }
 
     /// Cuts the stroke to `clip`, as the renderer cuts a stroke drawn in a
@@ -325,6 +335,7 @@ impl LiveStroke {
             area,
             fringe,
             color: premultiplied(color),
+            pattern: self.pattern,
         });
         self.written = union(self.written, Some(rect));
         Some(rect)
@@ -461,6 +472,7 @@ impl LiveStroke {
             line: self.line,
             erase: self.erase,
             filled: self.filled.as_ref(),
+            pattern: self.pattern,
         }
     }
 
@@ -482,6 +494,7 @@ pub struct Painting<'a> {
     line: [u8; 4],
     erase: bool,
     filled: Option<&'a Filled>,
+    pattern: Option<Pattern>,
 }
 
 impl Painting<'_> {
@@ -524,14 +537,16 @@ impl Painting<'_> {
         if !inside(self.clip, x, y) {
             return;
         }
-        if let Some(filled) = self.filled {
-            let (x, y) = (x as i32, y as i32);
-            if filled.area.contains(x, y) {
+        let (xi, yi) = (x as i32, y as i32);
+        if let Some(filled) = self.filled
+            && filled.pattern.is_none_or(|p| p.contains(xi, yi))
+        {
+            if filled.area.contains(xi, yi) {
                 *layer = filled.color;
             } else if filled
                 .fringe
                 .as_ref()
-                .is_some_and(|fringe| fringe.contains(x, y))
+                .is_some_and(|fringe| fringe.contains(xi, yi))
             {
                 dest_over(layer, filled.color);
             }
@@ -541,7 +556,7 @@ impl Painting<'_> {
             if pixel[3] == 0 {
             } else if self.erase {
                 dest_out(layer, pixel[3]);
-            } else {
+            } else if self.pattern.is_none_or(|p| p.contains(xi, yi)) {
                 src_over(layer, &pixel);
             }
             return;
@@ -552,7 +567,7 @@ impl Painting<'_> {
         }
         if self.erase {
             erase(layer, self.line, cover);
-        } else {
+        } else if self.pattern.is_none_or(|p| p.contains(xi, yi)) {
             paint(layer, self.line, cover);
         }
     }

@@ -16,14 +16,18 @@ use ugu_core::document::{Document, Layer, LayerId, LayerKind};
 use ugu_core::history::LayerRevisions;
 use ugu_core::motion::frame_in_cycle;
 use ugu_core::ops::{self, AssetId, MaskId, Op, PaintLayer, Sampling, Wobble};
+use ugu_core::pattern::Pattern;
 use ugu_core::store::{BrushEngine, Mask, Stroke};
 use vello_cpu::color::AlphaColor;
 use vello_cpu::kurbo::{Affine, BezPath, Point, Rect, Shape, Vec2};
-use vello_cpu::peniko::{BlendMode, Compose, ImageQuality, ImageSampler, Mix};
+use vello_cpu::peniko::{BlendMode, Compose, Extend, ImageQuality, ImageSampler, Mix};
 use vello_cpu::{Image, ImageSource, Pixmap, RasterizerSettings, RenderContext, Resources};
 
+use crate::compose::premultiplied;
 use crate::composite::{self, Source};
 use crate::dab::{self, Dab};
+use crate::filter::FilterPass;
+use crate::gradient::GradientDraw;
 use crate::mask::Runs;
 use crate::outline;
 use crate::pixel;
@@ -211,6 +215,13 @@ enum Step<'a> {
         color: [u8; 4],
         ready: Arc<Ready>,
         behind: bool,
+        pattern: Option<Pattern>,
+    },
+    /// Renders a quantized/dithered gradient over `bounds`, masked by `clip`.
+    Gradient {
+        draw: GradientDraw,
+        clip: Option<&'a Mask>,
+        bounds: [u32; 4],
     },
     /// Removes what is in the area.
     Clear {
@@ -515,6 +526,9 @@ impl DocumentRenderer {
         Some(match &layer.kind {
             LayerKind::Paint(paint) => self.draw_alone(document, 0, shrink, paint).to_pixmap(),
             LayerKind::Group(_) => self.group_alone(document, layer, shrink.next_power_of_two()),
+            LayerKind::Filter(filter) => {
+                FilterPass::thumbnail(filter, scaled_size(document.canvas, shrink))
+            }
         })
     }
 
@@ -1106,15 +1120,15 @@ impl Raster {
                         }
                     }
                     Step::Fill {
-                        color: [r, g, b, a],
+                        color,
                         ready,
                         behind: true,
+                        pattern,
                     } => {
-                        let color = AlphaColor::from_rgba8(*r, *g, *b, *a);
                         let behind = BlendMode::new(Mix::Normal, Compose::DestOver);
                         self.context
                             .push_layer(None, Some(behind), None, None, None);
-                        self.context.set_paint(color);
+                        set_paint_with_pattern(&mut self.context, *color, *pattern);
                         self.context.fill_path(&ready.area);
                         if let Some(fringe) = &ready.fringe {
                             self.context.fill_path(fringe);
@@ -1122,22 +1136,39 @@ impl Raster {
                         self.context.pop_layer();
                     }
                     Step::Fill {
-                        color: [r, g, b, a],
+                        color,
                         ready,
                         behind: false,
+                        pattern,
                     } => {
-                        let color = AlphaColor::from_rgba8(*r, *g, *b, *a);
-                        self.take_away(&ready.area);
-                        self.context.set_paint(color);
+                        if let Some(pat) = pattern {
+                            let mode = BlendMode::new(Mix::Normal, Compose::DestOut);
+                            self.context.push_layer(None, Some(mode), None, None, None);
+                            set_paint_with_pattern(&mut self.context, [0, 0, 0, 255], Some(*pat));
+                            self.context.fill_path(&ready.area);
+                            self.context.pop_layer();
+                        } else {
+                            self.take_away(&ready.area);
+                        }
+                        set_paint_with_pattern(&mut self.context, *color, *pattern);
                         self.context.fill_path(&ready.area);
                         if let Some(fringe) = &ready.fringe {
                             let behind = BlendMode::new(Mix::Normal, Compose::DestOver);
                             self.context
                                 .push_layer(None, Some(behind), None, None, None);
-                            self.context.set_paint(color);
+                            set_paint_with_pattern(&mut self.context, *color, *pattern);
                             self.context.fill_path(fringe);
                             self.context.pop_layer();
                         }
+                    }
+                    Step::Gradient { draw, clip, bounds } => {
+                        let pixmap = Arc::new(draw.render_rect(*bounds, *clip, shrink));
+                        self.context.set_transform(
+                            here * Affine::translate((f64::from(bounds[0]), f64::from(bounds[1])))
+                                * Affine::scale(f64::from(shrink.max(1))),
+                        );
+                        self.put_image(&pixmap, ImageQuality::Low);
+                        self.context.set_transform(here);
                     }
                     Step::Clear { ready } => self.take_away(&ready.area),
                     Step::Image {
@@ -1331,14 +1362,12 @@ impl Raster {
         }
         self.context
             .set_aliasing_threshold((!stroke.brush.antialias).then_some(128));
-        let paint = if erase {
-            [0, 0, 0, alpha]
+        if erase {
+            self.context
+                .set_paint(AlphaColor::from_rgba8(0, 0, 0, alpha));
         } else {
-            [r, g, b, alpha]
-        };
-        self.context.set_paint(AlphaColor::from_rgba8(
-            paint[0], paint[1], paint[2], paint[3],
-        ));
+            set_paint_with_pattern(&mut self.context, [r, g, b, alpha], stroke.pattern);
+        }
         self.context.fill_path(path);
         self.context.set_aliasing_threshold(None);
         if layer {
@@ -1385,7 +1414,8 @@ impl Raster {
                         }
                         let [r, g, b, _] = if *erase { [0; 4] } else { stroke.color.0 };
                         let look = dab::look(&stroke.brush);
-                        jobs.push((index, placement, look, [r, g, b]));
+                        let pattern = (!*erase).then_some(stroke.pattern).flatten();
+                        jobs.push((index, placement, look, [r, g, b], pattern));
                     }
                     index += 1;
                 }
@@ -1399,8 +1429,8 @@ impl Raster {
         }
         let mut buffers = self.buffers[self.used..self.used + painting].iter_mut();
         let mut tasks = Vec::new();
-        for (slot, (_, placement, look, rgb)) in jobs.iter().enumerate() {
-            let Some((_, [width, height])) = placement else {
+        for (slot, (_, placement, look, rgb, pattern)) in jobs.iter().enumerate() {
+            let Some((origin, [width, height])) = placement else {
                 continue;
             };
             let buffer = buffers.next().expect("one for each");
@@ -1409,7 +1439,7 @@ impl Raster {
             }
             let pixels = Arc::get_mut(buffer).expect("just made");
             pixels.resize(*width, *height);
-            let task = (pixels, &self.placed[slot], *look, *rgb);
+            let task = (pixels, &self.placed[slot], *look, *rgb, *origin, *pattern);
             tasks.push(std::sync::Mutex::new(task));
         }
         let threads = self.threads.min(tasks.len()).max(1);
@@ -1418,14 +1448,30 @@ impl Raster {
         self.painters
             .resize_with(threads.max(self.painters.len()), Default::default);
         let next = std::sync::atomic::AtomicUsize::new(0);
+        let [scale, _, _, _, dx, dy] = here.as_coeffs();
         let work = |painter: &mut dab::Painter| {
             while let Some(task) = tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
                 let mut task = task.lock().expect("no panic while painting");
-                let (pixels, placed, look, rgb) = &mut *task;
+                let (pixels, placed, look, rgb, origin, pattern) = &mut *task;
                 let width = usize::from(pixels.width());
+                let height = usize::from(pixels.height());
                 let bytes = pixels.data_as_u8_slice_mut();
                 bytes.fill(0);
                 painter.paint(bytes, width, placed, *look, *rgb, per_task);
+                if let Some(pat) = *pattern {
+                    for py in 0..height {
+                        let doc_y =
+                            ((f64::from(origin[1]) + py as f64 + 0.5 - dy) / scale).floor() as i32;
+                        for px in 0..width {
+                            let doc_x = ((f64::from(origin[0]) + px as f64 + 0.5 - dx) / scale)
+                                .floor() as i32;
+                            if !pat.contains(doc_x, doc_y) {
+                                let at = (py * width + px) * 4;
+                                bytes[at..at + 4].fill(0);
+                            }
+                        }
+                    }
+                }
             }
         };
         if threads == 1 {
@@ -1475,6 +1521,34 @@ impl Raster {
         self.context.fill_path(area);
         self.context.pop_layer();
     }
+}
+
+fn set_paint_with_pattern(context: &mut RenderContext, rgba: [u8; 4], pattern: Option<Pattern>) {
+    let Some(pattern) = pattern else {
+        context.set_paint(AlphaColor::from_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]));
+        return;
+    };
+    let w = u16::from(pattern.width);
+    let h = u16::from(pattern.height);
+    let mut tile = Pixmap::new(w, h);
+    let premul = premultiplied(rgba);
+    let pixels = tile.data_as_u8_slice_mut().as_chunks_mut::<4>().0;
+    for y in 0..usize::from(h) {
+        for x in 0..usize::from(w) {
+            if pattern.contains(x as i32, y as i32) {
+                pixels[y * usize::from(w) + x] = premul;
+            }
+        }
+    }
+    context.set_paint(Image {
+        image: ImageSource::Pixmap(Arc::new(tile)),
+        sampler: ImageSampler {
+            x_extend: Extend::Repeat,
+            y_extend: Extend::Repeat,
+            quality: ImageQuality::Low,
+            ..ImageSampler::default()
+        },
+    });
 }
 
 /// Whether the mask in `ready`, drawn with `transform`, covers every pixel
@@ -1639,6 +1713,11 @@ fn step_bounds(steps: &[Step<'_>], out: &mut Vec<[f64; 4]>) {
             Step::Fill { ready, .. } => {
                 out.extend(ready.bounds.map(|bounds| bounds.map(f64::from)))
             }
+            Step::Gradient { bounds, .. } => {
+                if bounds[0] < bounds[2] && bounds[1] < bounds[3] {
+                    out.push(bounds.map(f64::from));
+                }
+            }
             Step::Image {
                 image, transform, ..
             } => out.push(moved_bounds(
@@ -1712,6 +1791,23 @@ fn op_bounds(
                 }
                 if bounds[0] < bounds[2] && bounds[1] < bounds[3] {
                     out.push(bounds.map(f64::from));
+                }
+            }
+            Op::Gradient { clip, .. } => {
+                let bounds = clip.as_ref().and_then(|id| store.masks.get(id)).map_or(
+                    [0.0, 0.0, f64::from(size[0]), f64::from(size[1])],
+                    |mask| {
+                        let [l, t, w, h] = mask.bounds;
+                        [
+                            l.max(0) as f64,
+                            t.max(0) as f64,
+                            (l + w).min(size[0] as i32) as f64,
+                            (t + h).min(size[1] as i32) as f64,
+                        ]
+                    },
+                );
+                if bounds[0] < bounds[2] && bounds[1] < bounds[3] {
+                    out.push(bounds);
                 }
             }
             Op::PlaceImage {
@@ -2075,6 +2171,7 @@ fn collect<'a>(
                 antialias,
                 clip,
                 behind,
+                pattern,
             } => {
                 let Some(coverage) = store.masks.get(coverage) else {
                     continue;
@@ -2086,7 +2183,35 @@ fn collect<'a>(
                         color: color.0,
                         ready,
                         behind: *behind,
+                        pattern: *pattern,
                     });
+                }
+            }
+            Op::Gradient {
+                gradient,
+                shape,
+                from,
+                to,
+                dither,
+                quantize,
+                opacity,
+                clip,
+            } => {
+                let Some(gradient) = store.gradients.get(gradient) else {
+                    continue;
+                };
+                let clip = clip.and_then(|id| store.masks.get(&id));
+                let draw = GradientDraw {
+                    gradient: gradient.clone(),
+                    shape: *shape,
+                    from: *from,
+                    to: *to,
+                    dither: *dither,
+                    quantize: *quantize,
+                    opacity: *opacity,
+                };
+                if let Some(bounds) = draw.bounds(clip, *size) {
+                    steps.push(Step::Gradient { draw, clip, bounds });
                 }
             }
             Op::ClearSelection { mask } => {
@@ -2258,6 +2383,7 @@ mod tests {
                     ..Brush::default()
                 },
                 seed: 0x1234 + u64::from(id.0),
+                pattern: None,
             },
         );
         id
@@ -2266,7 +2392,7 @@ mod tests {
     fn paint_layer(document: &mut Document) -> &mut PaintLayer {
         match &mut document.layers[0].kind {
             LayerKind::Paint(paint) => paint,
-            LayerKind::Group(_) => unreachable!(),
+            LayerKind::Group(_) | LayerKind::Filter(_) => unreachable!(),
         }
     }
 
@@ -2895,6 +3021,7 @@ mod tests {
                             antialias: true,
                             clip,
                             behind: false,
+                            pattern: None,
                         },
                     ],
                 ),
@@ -2940,6 +3067,7 @@ mod tests {
             antialias: true,
             clip: Some(clip),
             behind: false,
+            pattern: None,
         };
         let mixed = with_ops(
             &document,
@@ -3508,6 +3636,7 @@ mod tests {
             antialias: true,
             clip: None,
             behind: false,
+            pattern: None,
         };
         let erase = Op::Erase {
             stroke: eraser,
@@ -3573,6 +3702,7 @@ mod tests {
                 width,
                 brush,
                 seed: 0x1234_5678_9abc_def0,
+                pattern: None,
             },
         );
         id

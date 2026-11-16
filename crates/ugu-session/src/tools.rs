@@ -9,9 +9,12 @@ use std::collections::HashMap;
 
 use ugu_core::brush::{self, Preset};
 use ugu_core::ops::{Rgba8, Sampling};
+use ugu_core::pattern::Pattern;
 use ugu_core::store::BrushEngine;
 
-use crate::{FillSettings, ShapeKind, ShapeSettings, TextSettings, Tool, ToolSettings};
+use crate::{
+    FillSettings, GradientSettings, ShapeKind, ShapeSettings, TextSettings, Tool, ToolSettings,
+};
 
 /// The colours strokes, fills and text were made with, newest first and each
 /// once, as 2.2.13's colour history.
@@ -137,6 +140,7 @@ impl Brushes {
             | Tool::Select
             | Tool::Wand
             | Tool::Fill
+            | Tool::Gradient
             | Tool::Text
             | Tool::Eyedropper
             | Tool::Shape
@@ -152,6 +156,7 @@ impl Brushes {
             | Tool::Select
             | Tool::Wand
             | Tool::Fill
+            | Tool::Gradient
             | Tool::Text
             | Tool::Eyedropper
             | Tool::Shape
@@ -170,6 +175,7 @@ impl Brushes {
             | Tool::Select
             | Tool::Wand
             | Tool::Fill
+            | Tool::Gradient
             | Tool::Text
             | Tool::Eyedropper
             | Tool::Shape
@@ -211,6 +217,8 @@ pub struct Tools {
     pub shape: ShapeSettings,
     pub uses_pressure: bool,
     pub fill: FillSettings,
+    pub gradient: GradientSettings,
+    pub pattern: Option<Pattern>,
     pub transform_sampling: Sampling,
     pub text: TextSettings,
     pub colors: ColorHistory,
@@ -229,6 +237,8 @@ impl Default for Tools {
             shape: ShapeSettings::DEFAULT,
             uses_pressure: true,
             fill: FillSettings::DEFAULT,
+            gradient: GradientSettings::default(),
+            pattern: None,
             transform_sampling: Sampling::Smooth,
             text: TextSettings::DEFAULT,
             colors: ColorHistory::default(),

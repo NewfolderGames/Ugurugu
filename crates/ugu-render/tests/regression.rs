@@ -114,7 +114,7 @@ fn before(document: &Document, layer: LayerId, count: usize) -> Document {
 fn ops(document: &Document, layer: LayerId) -> &[Op] {
     match &document.layer(layer).expect("there").kind {
         LayerKind::Paint(paint) => &paint.ops,
-        LayerKind::Group(_) => unreachable!(),
+        LayerKind::Group(_) | LayerKind::Filter(_) => unreachable!(),
     }
 }
 
